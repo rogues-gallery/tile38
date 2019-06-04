@@ -365,6 +365,31 @@ func keys_FIELDS_search_test(mc *mockServer) error {
 		{"SET", "mykey", "5" /* field1 undefined */, "FIELD", "field2", 15, "FIELD", "field3", 28, "OBJECT", `{"type":"Point","coordinates":[-112.2799,33.5228]}`}, {"OK"},
 		{"SET", "mykey", "6" /* field1 & field2 undefined               */, "FIELD", "field3", 29, "OBJECT", `{"type":"Point","coordinates":[-112.2801,33.5230]}`}, {"OK"},
 		{"SET", "mykey", "7" /* field1, field2, & field3 undefined                             */, "OBJECT", `{"type":"Point","coordinates":[-112.2803,33.5232]}`}, {"OK"},
+
+		// test RESP output
+		{"NEARBY", "mykey", "WHERE", "field2", 11, "+inf", "POINT", 33.462, -112.268, 60000}, {
+			`[0 [` +
+				`[1 {"type":"Point","coordinates":[-112.2791,33.522]} [field1 10 field2 11]] ` +
+				`[3 {"type":"Point","coordinates":[-112.2795,33.5224]} [field1 30 field2 13]] ` +
+				`[4 {"type":"Point","coordinates":[-112.2797,33.5226]} [field1 40 field2 14]] ` +
+				`[5 {"type":"Point","coordinates":[-112.2799,33.5228]} [field2 15 field3 28]]]]`},
+		{"NEARBY", "mykey", "WHERE", "field2", 0, 2, "POINT", 33.462, -112.268, 60000}, {
+			`[0 [` +
+				`[6 {"type":"Point","coordinates":[-112.2801,33.523]} [field3 29]] ` +
+				`[7 {"type":"Point","coordinates":[-112.2803,33.5232]}]]]`},
+
+		{"WITHIN", "mykey", "WHERE", "field2", 11, "+inf", "CIRCLE", 33.462, -112.268, 60000}, {
+			`[0 [` +
+				`[1 {"type":"Point","coordinates":[-112.2791,33.522]} [field1 10 field2 11]] ` +
+				`[3 {"type":"Point","coordinates":[-112.2795,33.5224]} [field1 30 field2 13]] ` +
+				`[4 {"type":"Point","coordinates":[-112.2797,33.5226]} [field1 40 field2 14]] ` +
+				`[5 {"type":"Point","coordinates":[-112.2799,33.5228]} [field2 15 field3 28]]]]`},
+		{"WITHIN", "mykey", "WHERE", "field2", 0, 2, "CIRCLE", 33.462, -112.268, 60000}, {
+			`[0 [` +
+				`[6 {"type":"Point","coordinates":[-112.2801,33.523]} [field3 29]] ` +
+				`[7 {"type":"Point","coordinates":[-112.2803,33.5232]}]]]`},
+
+		// test JSON output
 		{"OUTPUT", "json"}, {`{"ok":true}`},
 		{"NEARBY", "mykey", "WHERE", "field2", 11, "+inf", "POINT", 33.462, -112.268, 60000}, {
 			`{"ok":true,"fields":["field1","field2","field3"],"objects":[` +
