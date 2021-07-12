@@ -9,7 +9,7 @@ import (
 	"github.com/tidwall/tile38/internal/glob"
 )
 
-func (c *Server) cmdKeys(msg *Message) (res resp.Value, err error) {
+func (s *Server) cmdKeys(msg *Message) (res resp.Value, err error) {
 	var start = time.Now()
 	vs := msg.Args[1:]
 
@@ -36,17 +36,18 @@ func (c *Server) cmdKeys(msg *Message) (res resp.Value, err error) {
 	var greaterPivot string
 	var vals []resp.Value
 
-	iterator := func(key string, value interface{}) bool {
+	iterator := func(v interface{}) bool {
+		vcol := v.(*collectionKeyContainer)
 		var match bool
 		if everything {
 			match = true
 		} else if greater {
-			if !strings.HasPrefix(key, greaterPivot) {
+			if !strings.HasPrefix(vcol.key, greaterPivot) {
 				return false
 			}
 			match = true
 		} else {
-			match, _ = glob.Match(pattern, key)
+			match, _ = glob.Match(pattern, vcol.key)
 		}
 		if match {
 			if once {
@@ -58,9 +59,9 @@ func (c *Server) cmdKeys(msg *Message) (res resp.Value, err error) {
 			}
 			switch msg.OutputType {
 			case JSON:
-				wr.WriteString(jsonString(key))
+				wr.WriteString(jsonString(vcol.key))
 			case RESP:
-				vals = append(vals, resp.StringValue(key))
+				vals = append(vals, resp.StringValue(vcol.key))
 			}
 
 			// If no more than one match is expected, stop searching
@@ -74,20 +75,20 @@ func (c *Server) cmdKeys(msg *Message) (res resp.Value, err error) {
 	// TODO: This can be further optimized by using glob.Parse and limits
 	if pattern == "*" {
 		everything = true
-		c.cols.Scan(iterator)
+		s.cols.Ascend(nil, iterator)
 	} else if strings.HasSuffix(pattern, "*") {
 		greaterPivot = pattern[:len(pattern)-1]
 		if glob.IsGlob(greaterPivot) {
-			c.cols.Scan(iterator)
+			s.cols.Ascend(nil, iterator)
 		} else {
 			greater = true
-			c.cols.Ascend(greaterPivot, iterator)
+			s.cols.Ascend(&collectionKeyContainer{key: greaterPivot}, iterator)
 		}
 	} else {
-		c.cols.Scan(iterator)
+		s.cols.Ascend(nil, iterator)
 	}
 	if msg.OutputType == JSON {
-		wr.WriteString(`],"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		wr.WriteString(`],"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(wr.String()), nil
 	}
 	return resp.ArrayValue(vals), nil

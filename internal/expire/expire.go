@@ -41,9 +41,10 @@ func (list *List) bg() {
 		}
 		if now > list.queue.peek().unix { // now.After(list.queue.peek().unix)
 			n := list.queue.pop()
+			exfn := list.Expired
 			list.mu.Unlock()
-			if list.Expired != nil {
-				list.Expired(n.item)
+			if exfn != nil {
+				exfn(n.item)
 			}
 		} else {
 			list.mu.Unlock()
@@ -61,7 +62,6 @@ type qnode struct {
 type queue struct {
 	nodes []qnode
 	len   int
-	size  int
 }
 
 func (q *queue) push(unix int64, item Item) {

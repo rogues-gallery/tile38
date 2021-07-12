@@ -16,6 +16,7 @@ package mqtt
 
 import (
 	"crypto/tls"
+	"net/http"
 	"net/url"
 	"time"
 )
@@ -25,7 +26,7 @@ type ClientOptionsReader struct {
 	options *ClientOptions
 }
 
-//Servers returns a slice of the servers defined in the clientoptions
+// Servers returns a slice of the servers defined in the clientoptions
 func (r *ClientOptionsReader) Servers() []*url.URL {
 	s := make([]*url.URL, len(r.options.Servers))
 
@@ -37,25 +38,31 @@ func (r *ClientOptionsReader) Servers() []*url.URL {
 	return s
 }
 
-//ClientID returns the set client id
+// ResumeSubs returns true if resuming stored (un)sub is enabled
+func (r *ClientOptionsReader) ResumeSubs() bool {
+	s := r.options.ResumeSubs
+	return s
+}
+
+// ClientID returns the set client id
 func (r *ClientOptionsReader) ClientID() string {
 	s := r.options.ClientID
 	return s
 }
 
-//Username returns the set username
+// Username returns the set username
 func (r *ClientOptionsReader) Username() string {
 	s := r.options.Username
 	return s
 }
 
-//Password returns the set password
+// Password returns the set password
 func (r *ClientOptionsReader) Password() string {
 	s := r.options.Password
 	return s
 }
 
-//CleanSession returns whether Cleansession is set
+// CleanSession returns whether Cleansession is set
 func (r *ClientOptionsReader) CleanSession() bool {
 	s := r.options.CleanSession
 	return s
@@ -96,13 +103,13 @@ func (r *ClientOptionsReader) ProtocolVersion() uint {
 	return s
 }
 
-func (r *ClientOptionsReader) TLSConfig() tls.Config {
+func (r *ClientOptionsReader) TLSConfig() *tls.Config {
 	s := r.options.TLSConfig
 	return s
 }
 
 func (r *ClientOptionsReader) KeepAlive() time.Duration {
-	s := r.options.KeepAlive
+	s := time.Duration(r.options.KeepAlive * int64(time.Second))
 	return s
 }
 
@@ -126,6 +133,18 @@ func (r *ClientOptionsReader) AutoReconnect() bool {
 	return s
 }
 
+// ConnectRetryInterval returns the delay between retries on the initial connection (if ConnectRetry true)
+func (r *ClientOptionsReader) ConnectRetryInterval() time.Duration {
+	s := r.options.ConnectRetryInterval
+	return s
+}
+
+// ConnectRetry returns whether the initial connection request will be retried until connection established
+func (r *ClientOptionsReader) ConnectRetry() bool {
+	s := r.options.ConnectRetry
+	return s
+}
+
 func (r *ClientOptionsReader) WriteTimeout() time.Duration {
 	s := r.options.WriteTimeout
 	return s
@@ -133,5 +152,16 @@ func (r *ClientOptionsReader) WriteTimeout() time.Duration {
 
 func (r *ClientOptionsReader) MessageChannelDepth() uint {
 	s := r.options.MessageChannelDepth
+	return s
+}
+
+func (r *ClientOptionsReader) HTTPHeaders() http.Header {
+	h := r.options.HTTPHeaders
+	return h
+}
+
+// WebsocketOptions returns the currently configured WebSocket options
+func (r *ClientOptionsReader) WebsocketOptions() *WebsocketOptions {
+	s := r.options.WebsocketOptions
 	return s
 }

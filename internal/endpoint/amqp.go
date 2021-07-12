@@ -9,9 +9,7 @@ import (
 	"github.com/streadway/amqp"
 )
 
-const (
-	amqpExpiresAfter = time.Second * 30
-)
+const amqpExpiresAfter = time.Second * 30
 
 // AMQPConn is an endpoint connection
 type AMQPConn struct {
@@ -28,7 +26,7 @@ func (conn *AMQPConn) Expired() bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	if !conn.ex {
-		if time.Now().Sub(conn.t) > amqpExpiresAfter {
+		if time.Since(conn.t) > amqpExpiresAfter {
 			conn.ex = true
 			conn.close()
 		}
@@ -126,7 +124,7 @@ func (conn *AMQPConn) Send(msg string) error {
 			ContentEncoding: "",
 			Body:            []byte(msg),
 			DeliveryMode:    conn.ep.AMQP.DeliveryMode,
-			Priority:        0,
+			Priority:        conn.ep.AMQP.Priority,
 		},
 	)
 }

@@ -2,37 +2,99 @@ package tests
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
 	"sort"
 	"testing"
+	"time"
+
+	"github.com/gomodule/redigo/redis"
+	"github.com/tidwall/gjson"
 )
 
 func subTestSearch(t *testing.T, mc *mockServer) {
-	runStep(t, mc, "KNN", keys_KNN_test)
+	runStep(t, mc, "KNN_BASIC", keys_KNN_basic_test)
+	runStep(t, mc, "KNN_RANDOM", keys_KNN_random_test)
 	runStep(t, mc, "KNN_CURSOR", keys_KNN_cursor_test)
 	runStep(t, mc, "WITHIN_CIRCLE", keys_WITHIN_CIRCLE_test)
 	runStep(t, mc, "INTERSECTS_CIRCLE", keys_INTERSECTS_CIRCLE_test)
 	runStep(t, mc, "WITHIN", keys_WITHIN_test)
 	runStep(t, mc, "WITHIN_CURSOR", keys_WITHIN_CURSOR_test)
+	runStep(t, mc, "WITHIN_CLIPBY", keys_WITHIN_CLIPBY_test)
 	runStep(t, mc, "INTERSECTS", keys_INTERSECTS_test)
 	runStep(t, mc, "INTERSECTS_CURSOR", keys_INTERSECTS_CURSOR_test)
+	runStep(t, mc, "INTERSECTS_CLIPBY", keys_INTERSECTS_CLIPBY_test)
 	runStep(t, mc, "SCAN_CURSOR", keys_SCAN_CURSOR_test)
 	runStep(t, mc, "SEARCH_CURSOR", keys_SEARCH_CURSOR_test)
 	runStep(t, mc, "MATCH", keys_MATCH_test)
 	runStep(t, mc, "FIELDS", keys_FIELDS_search_test)
 }
 
-func keys_KNN_test(mc *mockServer) error {
+func keys_KNN_basic_test(mc *mockServer) error {
 	return mc.DoBatch([][]interface{}{
 		{"SET", "mykey", "1", "POINT", 5, 5}, {"OK"},
 		{"SET", "mykey", "2", "POINT", 19, 19}, {"OK"},
 		{"SET", "mykey", "3", "POINT", 12, 19}, {"OK"},
 		{"SET", "mykey", "4", "POINT", -5, 5}, {"OK"},
 		{"SET", "mykey", "5", "POINT", 33, 21}, {"OK"},
+		{"SET", "mykey", "6", "POINT", 52, 13}, {"OK"},
 		{"NEARBY", "mykey", "LIMIT", 10, "POINTS", "POINT", 20, 20}, {
-			"[0 [[2 [19 19]] [3 [12 19]] [5 [33 21]] [1 [5 5]] [4 [-5 5]]]]"},
-		{"NEARBY", "mykey", "LIMIT", 10, "IDS", "POINT", 20, 20, 4000000}, {"[0 [2 3 5 1 4]]"},
+			"[0 [[2 [19 19]] [3 [12 19]] [5 [33 21]] [1 [5 5]] [4 [-5 5]] [6 [52 13]]]]"},
+		{"NEARBY", "mykey", "LIMIT", 10, "IDS", "POINT", 20, 20, 4000000}, {"[0 [2 3 5 1 4 6]]"},
 		{"NEARBY", "mykey", "LIMIT", 10, "IDS", "POINT", 20, 20, 1500000}, {"[0 [2 3 5]]"},
+		{"NEARBY", "mykey", "LIMIT", 10, "DISTANCE", "POINT", 52, 13, 100}, {`[0 [[6 {"type":"Point","coordinates":[13,52]} 0]]]`},
+		{"NEARBY", "mykey", "LIMIT", 10, "DISTANCE", "POINT", 52.1, 13.1, 100000}, {`[0 [[6 {"type":"Point","coordinates":[13,52]} 13053.885940801563]]]`},
 	})
+}
+
+func keys_KNN_random_test(mc *mockServer) error {
+
+	// do random points
+	mc.Do("OUTPUT", "resp")
+	mc.Do("DROP", "points")
+	defer mc.Do("DROP", "points")
+
+	seed := time.Now().UnixNano()
+	// seed = 98123098
+	rng := rand.New(rand.NewSource(seed))
+	rpoint := func() [2]float64 {
+		return [2]float64{
+			rng.Float64()*360 - 180,
+			rng.Float64()*180 - 90,
+		}
+	}
+	N := 5000
+	points := make([][2]float64, N)
+	for i := 0; i < len(points); i++ {
+		points[i] = rpoint()
+		res, err := redis.String(mc.Do("SET", "points", i, "POINT", points[i][1], points[i][0]))
+		if err != nil {
+			return err
+		}
+		if res != "OK" {
+			return fmt.Errorf("expected 'OK', got '%s'", res)
+		}
+	}
+	target := rpoint()
+
+	mc.Do("OUTPUT", "json")
+	defer mc.Do("OUTPUT", "resp")
+
+	start := time.Now()
+	res, err := redis.String(mc.Do("NEARBY", "points", "LIMIT", N, "POINT", target[1], target[0]))
+	println(time.Since(start).String())
+	if err != nil {
+		return err
+	}
+
+	ldist := math.Inf(-1)
+	for _, dist := range gjson.Get(res, "objects.#.distance").Array() {
+		if ldist > dist.Float() {
+			return fmt.Errorf("out of order")
+		}
+		ldist = dist.Float()
+	}
+	return nil
 }
 
 func keys_KNN_cursor_test(mc *mockServer) error {
@@ -142,6 +204,50 @@ func keys_WITHIN_CURSOR_test(mc *mockServer) error {
 	})
 }
 
+func keys_WITHIN_CLIPBY_test(mc *mockServer) error {
+	jagged := `{
+		"type":"Polygon",
+		"coordinates":[[
+			[-122.47781753540039,37.74655746554895],
+			[-122.48777389526366,37.7355619376922],
+			[-122.4707794189453,37.73271097867418],
+			[-122.46528625488281,37.735969208590504],
+			[-122.45189666748047,37.73922729512254],
+			[-122.4565315246582,37.75008654795525],
+			[-122.46683120727538,37.75307256315459],
+			[-122.47781753540039,37.74655746554895]
+		]]
+	}`
+
+	return mc.DoBatch([][]interface{}{
+		{"SET", "mykey", "point1", "FIELD", "foo", 1, "POINT", 37.73963454585715, -122.4810791015625}, {"OK"},
+		{"SET", "mykey", "point2", "FIELD", "foo", 2, "POINT", 37.75130811419222, -122.47438430786133}, {"OK"},
+		{"SET", "mykey", "point3", "FIELD", "foo", 1, "POINT", 37.74816932695052, -122.47713088989258}, {"OK"},
+		{"SET", "mykey", "point4", "FIELD", "foo", 2, "POINT", 37.74503040657439, -122.47571468353271}, {"OK"},
+		{"SET", "other", "jagged", "OBJECT", jagged}, {"OK"},
+
+		{"WITHIN", "mykey", "IDS", "GET", "other", "jagged"}, {"[0 [point1 point4]]"},
+		{"WITHIN", "mykey", "IDS", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point3 point4]]"},
+		{"WITHIN", "mykey", "IDS", "GET", "other", "jagged", "CLIPBY", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point4]]"},
+		{"WITHIN", "mykey", "IDS", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+		}, {"[0 [point2 point3 point4]]"},
+		{"WITHIN", "mykey", "IDS", "GET", "other", "jagged", "CLIPBY", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+		}, {"[0 [point4]]"},
+		{"WITHIN", "mykey", "IDS", "GET", "other", "jagged",
+			"CLIPBY", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+			"CLIPBY", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point4]]"},
+	})
+}
+
 func keys_INTERSECTS_test(mc *mockServer) error {
 	return mc.DoBatch([][]interface{}{
 		{"SET", "mykey", "point1", "POINT", 37.7335, -122.4412}, {"OK"},
@@ -189,6 +295,50 @@ func keys_INTERSECTS_test(mc *mockServer) error {
 		{"SET", "key7", "multipoly17", "OBJECT", `{"type":"MultiPolygon","coordinates":[[[[-122.44056701660155,37.7332964524295],[-122.44029879570007,37.7332964524295],[-122.44029879570007,37.73375464605226],[-122.44056701660155,37.73375464605226],[-122.44056701660155,37.7332964524295]]],[[[-122.44032025337218,37.73267703802467],[-122.44013786315918,37.73267703802467],[-122.44013786315918,37.732838255971316],[-122.44032025337218,37.732838255971316],[-122.44032025337218,37.73267703802467]]]]}`}, {"OK"},
 		{"SET", "key7", "multipoly17.1", "OBJECT", `{"type":"MultiPolygon","coordinates":[[[[-122.4407172203064,37.73270249351328],[-122.44049191474916,37.73270249351328],[-122.44049191474916,37.73286371140448],[-122.4407172203064,37.73286371140448],[-122.4407172203064,37.73270249351328]]],[[[-122.44032025337218,37.73267703802467],[-122.44013786315918,37.73267703802467],[-122.44013786315918,37.732838255971316],[-122.44032025337218,37.732838255971316],[-122.44032025337218,37.73267703802467]]]]}`}, {"OK"},
 		{"INTERSECTS", "key7", "IDS", "GET", "mykey", "multipoly5"}, {"[0 [multipoly15 multipoly16 multipoly17]]"},
+	})
+}
+
+func keys_INTERSECTS_CLIPBY_test(mc *mockServer) error {
+	jagged := `{
+		"type":"Polygon",
+		"coordinates":[[
+			[-122.47781753540039,37.74655746554895],
+			[-122.48777389526366,37.7355619376922],
+			[-122.4707794189453,37.73271097867418],
+			[-122.46528625488281,37.735969208590504],
+			[-122.45189666748047,37.73922729512254],
+			[-122.4565315246582,37.75008654795525],
+			[-122.46683120727538,37.75307256315459],
+			[-122.47781753540039,37.74655746554895]
+		]]
+	}`
+
+	return mc.DoBatch([][]interface{}{
+		{"SET", "mykey", "point1", "FIELD", "foo", 1, "POINT", 37.73963454585715, -122.4810791015625}, {"OK"},
+		{"SET", "mykey", "point2", "FIELD", "foo", 2, "POINT", 37.75130811419222, -122.47438430786133}, {"OK"},
+		{"SET", "mykey", "point3", "FIELD", "foo", 1, "POINT", 37.74816932695052, -122.47713088989258}, {"OK"},
+		{"SET", "mykey", "point4", "FIELD", "foo", 2, "POINT", 37.74503040657439, -122.47571468353271}, {"OK"},
+		{"SET", "other", "jagged", "OBJECT", jagged}, {"OK"},
+
+		{"INTERSECTS", "mykey", "IDS", "GET", "other", "jagged"}, {"[0 [point1 point4]]"},
+		{"INTERSECTS", "mykey", "IDS", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point3 point4]]"},
+		{"INTERSECTS", "mykey", "IDS", "GET", "other", "jagged", "CLIPBY", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point4]]"},
+		{"INTERSECTS", "mykey", "IDS", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+		}, {"[0 [point2 point3 point4]]"},
+		{"INTERSECTS", "mykey", "IDS", "GET", "other", "jagged", "CLIPBY", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+		}, {"[0 [point4]]"},
+		{"INTERSECTS", "mykey", "IDS", "GET", "other", "jagged",
+			"CLIPBY", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+			"CLIPBY", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point4]]"},
 	})
 }
 
@@ -428,4 +578,20 @@ func match(expectIn string) func(org, v interface{}) (resp, expect interface{}) 
 		})
 		return fmt.Sprintf("%v", org), expectIn
 	}
+}
+
+func subBenchSearch(b *testing.B, mc *mockServer) {
+	runBenchStep(b, mc, "KNN", keys_KNN_bench)
+}
+
+func keys_KNN_bench(mc *mockServer) error {
+	lat := rand.Float64()*180 - 90
+	lon := rand.Float64()*360 - 180
+	_, err := mc.conn.Do("NEARBY",
+		"mykey",
+		"LIMIT", 50,
+		"DISTANCE",
+		"POINTS",
+		"POINT", lat, lon)
+	return err
 }

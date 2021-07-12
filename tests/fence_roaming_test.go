@@ -1,11 +1,12 @@
 package tests
 
 import (
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"time"
 
 	"github.com/gomodule/redigo/redis"
 	"github.com/tidwall/pretty"
@@ -82,78 +83,95 @@ func fence_roaming_webhook_test(mc *mockServer) error {
 	return <-finalErr
 }
 
+func goMultiFunc(mc *mockServer, fns ...func() error) error {
+	errs := make([]error, len(fns))
+	var wg sync.WaitGroup
+	wg.Add(len(fns))
+	for i := 0; i < len(fns); i++ {
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = fns[i]()
+		}(i)
+	}
+	wg.Wait()
+	var ferrs []error
+	for i := 0; i < len(errs); i++ {
+		if errs[i] != nil {
+			ferrs = append(ferrs, errs[i])
+		}
+	}
+	if len(ferrs) == 0 {
+		return nil
+	}
+	if len(ferrs) == 1 {
+		return ferrs[0]
+	}
+	return fmt.Errorf("%v", ferrs)
+}
+
 func fence_roaming_live_test(mc *mockServer) error {
 	car1, car2, expected := roamingTestData()
-	finalErr := make(chan error)
-
-	go func() {
-		// Create a connection for subscribing to geofence notifications
-		sc, err := redis.Dial("tcp", fmt.Sprintf(":%d", mc.port))
-		if err != nil {
-			finalErr <- err
-			return
-		}
-		defer sc.Close()
-
-		// Set up a live geofence stream
-		if _, err := sc.Do("NEARBY", "cars", "FENCE", "ROAM", "cars", "*", 1000); err != nil {
-			finalErr <- err
-			return
-		}
-
-		actual := []string{}
-		for sc.Err() == nil {
-			if err := func() error {
-				bodyi, err := sc.Receive()
+	var liveReady sync.WaitGroup
+	liveReady.Add(1)
+	return goMultiFunc(mc,
+		func() error {
+			sc, err := redis.DialTimeout("tcp", fmt.Sprintf(":%d", mc.port),
+				0, time.Second*5, time.Second*5)
+			if err != nil {
+				liveReady.Done()
+				return err
+			}
+			defer sc.Close()
+			// Set up a live geofence stream
+			reply, err := redis.String(
+				sc.Do("NEARBY", "cars", "FENCE", "ROAM", "cars", "*", 1000),
+			)
+			if err != nil {
+				liveReady.Done()
+				return err
+			}
+			if reply != "OK" {
+				liveReady.Done()
+				return fmt.Errorf("expected 'OK', got '%v'", reply)
+			}
+			liveReady.Done()
+			for i := 0; i < len(expected); i++ {
+				reply, err := redis.String(sc.Receive())
 				if err != nil {
 					return err
 				}
-				body, ok := bodyi.([]byte)
-				if !ok {
-					return errors.New("Non byte-slice received")
+				reply = cleanMessage([]byte(reply))
+				if reply != expected[i] {
+					return fmt.Errorf("Expected '%s' but got '%s'",
+						expected[i], reply)
 				}
-
-				// If the new message doesn't match whats expected an error
-				// should be returned
-				actual = append(actual, cleanMessage(body))
-				pos := len(actual) - 1
-				if len(expected) < pos+1 {
-					return fmt.Errorf("More messages than expected were received : '%s'", actual[pos])
-				}
-				if actual[pos] != expected[pos] {
-					return fmt.Errorf("Expected '%s' but got '%s'", expected[pos],
-						actual[pos])
-				}
-				if len(actual) == len(expected) {
-					finalErr <- nil
-				}
-				return nil
-			}(); err != nil {
-				finalErr <- err
 			}
-		}
-	}()
+			return nil
+		},
+		func() error {
+			liveReady.Wait()
+			bc, err := redis.Dial("tcp", fmt.Sprintf(":%d", mc.port))
+			if err != nil {
+				return err
+			}
+			defer bc.Close()
 
-	// Create the base connection for setting up points and geofences
-	bc, err := redis.Dial("tcp", fmt.Sprintf(":%d", mc.port))
-	if err != nil {
-		return err
-	}
-	defer bc.Close()
+			// Fire all car movement commands on the base client
+			for i := range car1 {
 
-	// Fire all car movement commands on the base client
-	for i := range car1 {
-		if _, err := bc.Do("SET", "cars", "car1", "POINT", car1[i][1],
-			car1[i][0]); err != nil {
-			return err
-		}
-		if _, err := bc.Do("SET", "cars", "car2", "POINT", car2[i][1],
-			car2[i][0]); err != nil {
-			return err
-		}
-	}
+				if _, err := bc.Do("SET", "cars", "car1", "POINT", car1[i][1],
+					car1[i][0]); err != nil {
+					return err
+				}
+				if _, err := bc.Do("SET", "cars", "car2", "POINT", car2[i][1],
+					car2[i][0]); err != nil {
+					return err
+				}
+			}
 
-	return <-finalErr
+			return nil
+		},
+	)
 }
 
 func fence_roaming_channel_test(mc *mockServer) error {
@@ -271,7 +289,6 @@ func roamingTestData() (car1 [][]float64, car2 [][]float64, output []string) {
 		`{"command":"set","detect":"roam","key":"cars","id":"car2","object":{"type":"Point","coordinates":[-111.91781044006346,33.414750027566235]},"nearby":{"key":"cars","id":"car1","object":{"type":"Point","coordinates":[-111.91789627075195,33.414750027566235]},"meters":7.966}}`,
 		`{"command":"set","detect":"roam","key":"cars","id":"car1","object":{"type":"Point","coordinates":[-111.9111156463623,33.414750027566235]},"nearby":{"key":"cars","id":"car2","object":{"type":"Point","coordinates":[-111.91781044006346,33.414750027566235]},"meters":621.377}}`,
 		`{"command":"set","detect":"roam","key":"cars","id":"car2","object":{"type":"Point","coordinates":[-111.92416191101074,33.414750027566235]},"faraway":{"key":"cars","id":"car1","object":{"type":"Point","coordinates":[-111.9111156463623,33.414750027566235]},"meters":1210.89}}`,
-		`{"command":"set","detect":"roam","key":"cars","id":"car1","object":{"type":"Point","coordinates":[-111.90510749816895,33.414750027566235]},"faraway":{"key":"cars","id":"car2","object":{"type":"Point","coordinates":[-111.92416191101074,33.414750027566235]},"meters":1768.536}}`,
 	}
 	return
 }

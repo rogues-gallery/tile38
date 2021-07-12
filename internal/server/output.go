@@ -7,7 +7,7 @@ import (
 	"github.com/tidwall/resp"
 )
 
-func (c *Server) cmdOutput(msg *Message) (res resp.Value, err error) {
+func (s *Server) cmdOutput(msg *Message) (res resp.Value, err error) {
 	start := time.Now()
 	vs := msg.Args[1:]
 	var arg string
@@ -34,7 +34,7 @@ func (c *Server) cmdOutput(msg *Message) (res resp.Value, err error) {
 	default:
 		return NOMessage, nil
 	case JSON:
-		return resp.StringValue(`{"ok":true,"output":"json","elapsed":` + time.Now().Sub(start).String() + `}`), nil
+		return resp.StringValue(`{"ok":true,"output":"json","elapsed":` + time.Since(start).String() + `}`), nil
 	case RESP:
 		return resp.StringValue("resp"), nil
 	}

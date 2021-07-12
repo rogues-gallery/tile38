@@ -37,8 +37,7 @@ func (server *Server) aofshrink() {
 		server.shrinking = false
 		server.shrinklog = nil
 		server.mu.Unlock()
-		log.Infof("aof shrink ended %v", time.Now().Sub(start))
-		return
+		log.Infof("aof shrink ended %v", time.Since(start))
 	}()
 
 	err := func() error {
@@ -92,40 +91,41 @@ func (server *Server) aofshrink() {
 					if col == nil {
 						return
 					}
-					var fnames = col.FieldArr()       // reload an array of field names to match each object
-					var exm = server.expires[keys[0]] // the expiration map
-					var now = time.Now()              // used for expiration
-					var count = 0                     // the object count
+					var fnames = col.FieldArr()     // reload an array of field names to match each object
+					var fmap = col.FieldMap()       //
+					var now = time.Now().UnixNano() // used for expiration
+					var count = 0                   // the object count
 					col.ScanGreaterOrEqual(nextid, false, nil, nil,
-						func(id string, obj geojson.Object, fields []float64) bool {
+						func(id string, obj geojson.Object, fields []float64, ex int64) bool {
 							if count == maxids {
 								// we reached the max number of ids for one batch
 								nextid = id
 								idsdone = false
 								return false
 							}
-
 							// here we fill the values array with a new command
 							values = values[:0]
 							values = append(values, "set")
 							values = append(values, keys[0])
 							values = append(values, id)
-							for i, fvalue := range fields {
-								if fvalue != 0 {
-									values = append(values, "field")
-									values = append(values, fnames[i])
-									values = append(values, strconv.FormatFloat(fvalue, 'f', -1, 64))
-								}
-							}
-							if exm != nil {
-								at, ok := exm[id]
-								if ok {
-									expires := at.Sub(now)
-									if expires > 0 {
-										values = append(values, "ex")
-										values = append(values, strconv.FormatFloat(math.Floor(float64(expires)/float64(time.Second)*10)/10, 'f', -1, 64))
+							if len(fields) > 0 {
+								fvs := orderFields(fmap, fnames, fields)
+								for _, fv := range fvs {
+									if fv.value != 0 {
+										values = append(values, "field")
+										values = append(values, fv.field)
+										values = append(values, strconv.FormatFloat(fv.value, 'f', -1, 64))
 									}
 								}
+							}
+							if ex != 0 {
+								ttl := math.Floor(float64(ex-now)/float64(time.Second)*10) / 10
+								if ttl < 0.1 {
+									// always leave a little bit of ttl.
+									ttl = 0.1
+								}
+								values = append(values, "ex")
+								values = append(values, strconv.FormatFloat(ttl, 'f', -1, 64))
 							}
 							if objIsSpatial(obj) {
 								values = append(values, "object")
@@ -192,20 +192,16 @@ func (server *Server) aofshrink() {
 				} else {
 					values = append(values, "sethook", name,
 						strings.Join(hook.Endpoints, ","))
-					values = append(values)
 				}
 				for _, meta := range hook.Metas {
 					values = append(values, "meta", meta.Name, meta.Value)
 				}
 				if !hook.expires.IsZero() {
-					ex := float64(hook.expires.Sub(time.Now())) /
-						float64(time.Second)
+					ex := float64(time.Until(hook.expires)) / float64(time.Second)
 					values = append(values, "ex",
 						strconv.FormatFloat(ex, 'f', 1, 64))
 				}
-				for _, value := range hook.Message.Args {
-					values = append(values, value)
-				}
+				values = append(values, hook.Message.Args...)
 				// append the values to the aof buffer
 				aofbuf = append(aofbuf, '*')
 				aofbuf = append(aofbuf, strconv.FormatInt(int64(len(values)), 10)...)
@@ -234,6 +230,18 @@ func (server *Server) aofshrink() {
 		return func() error {
 			server.mu.Lock()
 			defer server.mu.Unlock()
+
+			// kill all followers connections and close their files. This
+			// ensures that there is only one opened AOF at a time which is
+			// what Windows requires in order to perform the Rename function
+			// below.
+			for conn, f := range server.aofconnM {
+				conn.Close()
+				f.Close()
+			}
+
+			// send a broadcast to all sleeping followers
+			server.fcond.Broadcast()
 
 			// flush the aof buffer
 			server.flushAOF(false)
@@ -289,10 +297,6 @@ func (server *Server) aofshrink() {
 
 			os.Remove(core.AppendFileName + "-bak") // ignore error
 
-			// kill all followers connections
-			for conn := range server.aofconnM {
-				conn.Close()
-			}
 			return nil
 		}()
 	}()

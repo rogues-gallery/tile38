@@ -2,19 +2,18 @@ package server
 
 import (
 	"bytes"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mmcloughlin/geohash"
-	"github.com/tidwall/boxtree/d2"
+	"github.com/tidwall/btree"
 	"github.com/tidwall/geojson"
 	"github.com/tidwall/geojson/geometry"
 	"github.com/tidwall/resp"
+	"github.com/tidwall/rtree"
 	"github.com/tidwall/tile38/internal/collection"
 	"github.com/tidwall/tile38/internal/glob"
-	"github.com/tidwall/tinybtree"
 )
 
 type fvt struct {
@@ -22,22 +21,12 @@ type fvt struct {
 	value float64
 }
 
-type byField []fvt
-
-func (a byField) Len() int {
-	return len(a)
-}
-func (a byField) Less(i, j int) bool {
-	return a[i].field < a[j].field
-}
-func (a byField) Swap(i, j int) {
-	a[i], a[j] = a[j], a[i]
-}
-
-func orderFields(fmap map[string]int, fields []float64) []fvt {
+func orderFields(fmap map[string]int, farr []string, fields []float64) []fvt {
 	var fv fvt
+	var idx int
 	fvs := make([]fvt, 0, len(fmap))
-	for field, idx := range fmap {
+	for _, field := range farr {
+		idx = fmap[field]
 		if idx < len(fields) {
 			fv.field = field
 			fv.value = fields[idx]
@@ -46,7 +35,6 @@ func orderFields(fmap map[string]int, fields []float64) []fvt {
 			}
 		}
 	}
-	sort.Sort(byField(fvs))
 	return fvs
 }
 func (server *Server) cmdBounds(msg *Message) (resp.Value, error) {
@@ -98,7 +86,7 @@ func (server *Server) cmdBounds(msg *Message) (resp.Value, error) {
 	}
 	switch msg.OutputType {
 	case JSON:
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		return vals[0], nil
@@ -112,7 +100,7 @@ func (server *Server) cmdType(msg *Message) (resp.Value, error) {
 
 	var ok bool
 	var key string
-	if vs, key, ok = tokenval(vs); !ok || key == "" {
+	if _, key, ok = tokenval(vs); !ok || key == "" {
 		return NOMessage, errInvalidNumberOfArguments
 	}
 
@@ -128,7 +116,7 @@ func (server *Server) cmdType(msg *Message) (resp.Value, error) {
 
 	switch msg.OutputType {
 	case JSON:
-		return resp.StringValue(`{"ok":true,"type":` + string(typ) + `,"elapsed":"` + time.Now().Sub(start).String() + "\"}"), nil
+		return resp.StringValue(`{"ok":true,"type":` + string(typ) + `,"elapsed":"` + time.Since(start).String() + "\"}"), nil
 	case RESP:
 		return resp.SimpleStringValue(typ), nil
 	}
@@ -161,8 +149,7 @@ func (server *Server) cmdGet(msg *Message) (resp.Value, error) {
 		}
 		return NOMessage, errKeyNotFound
 	}
-	o, fields, ok := col.Get(id)
-	ok = ok && !server.hasExpired(key, id)
+	o, fields, _, ok := col.Get(id)
 	if !ok {
 		if msg.OutputType == RESP {
 			return resp.NullValue(), nil
@@ -221,7 +208,7 @@ func (server *Server) cmdGet(msg *Message) (resp.Value, error) {
 			buf.WriteString(`,"hash":`)
 		}
 		precision, err := strconv.ParseInt(sprecision, 10, 64)
-		if err != nil || precision < 1 || precision > 64 {
+		if err != nil || precision < 1 || precision > 12 {
 			return NOMessage, errInvalidArgument(sprecision)
 		}
 		center := o.Center()
@@ -254,7 +241,7 @@ func (server *Server) cmdGet(msg *Message) (resp.Value, error) {
 		return NOMessage, errInvalidNumberOfArguments
 	}
 	if withfields {
-		fvs := orderFields(col.FieldMap(), fields)
+		fvs := orderFields(col.FieldMap(), col.FieldArr(), fields)
 		if len(fvs) > 0 {
 			fvals := make([]resp.Value, 0, len(fvs)*2)
 			if msg.OutputType == JSON {
@@ -280,7 +267,7 @@ func (server *Server) cmdGet(msg *Message) (resp.Value, error) {
 	}
 	switch msg.OutputType {
 	case JSON:
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		var oval resp.Value
@@ -321,13 +308,12 @@ func (server *Server) cmdDel(msg *Message) (res resp.Value, d commandDetails, er
 			found = true
 		}
 	}
-	server.clearIDExpires(d.key, d.id)
 	d.command = "del"
 	d.updated = found
 	d.timestamp = time.Now()
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		if d.updated {
 			res = resp.IntegerValue(1)
@@ -386,7 +372,6 @@ func (server *Server) cmdPdel(msg *Message) (res resp.Value, d commandDetails, e
 			} else {
 				d.children[i] = dc
 			}
-			server.clearIDExpires(d.key, dc.id)
 		}
 		if atLeastOneNotDeleted {
 			var nchildren []*commandDetails
@@ -407,7 +392,7 @@ func (server *Server) cmdPdel(msg *Message) (res resp.Value, d commandDetails, e
 	d.parent = true
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		total := len(d.children) - expired
 		if total < 0 {
@@ -440,10 +425,9 @@ func (server *Server) cmdDrop(msg *Message) (res resp.Value, d commandDetails, e
 	}
 	d.command = "drop"
 	d.timestamp = time.Now()
-	server.clearKeyExpires(d.key)
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		if d.updated {
 			res = resp.IntegerValue(1)
@@ -489,18 +473,16 @@ func (server *Server) cmdRename(msg *Message, nx bool) (res resp.Value, d comman
 		d.updated = false
 	} else {
 		server.deleteCol(d.newKey)
-		server.clearKeyExpires(d.newKey)
 		d.updated = true
 	}
 	if d.updated {
 		server.deleteCol(d.key)
 		server.setCol(d.newKey, col)
-		server.moveKeyExpires(d.key, d.newKey)
 	}
 	d.timestamp = time.Now()
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		if !nx {
 			res = resp.SimpleStringValue("OK")
@@ -520,20 +502,17 @@ func (server *Server) cmdFlushDB(msg *Message) (res resp.Value, d commandDetails
 		err = errInvalidNumberOfArguments
 		return
 	}
-	server.cols = tinybtree.BTree{}
-	server.exlistmu.Lock()
-	server.exlist = nil
-	server.exlistmu.Unlock()
-	server.expires = make(map[string]map[string]time.Time)
+	server.cols = btree.New(byCollectionKey)
 	server.hooks = make(map[string]*Hook)
 	server.hooksOut = make(map[string]*Hook)
-	server.hookTree = d2.BoxTree{}
+	server.hookTree = rtree.RTree{}
+	server.hookCross = rtree.RTree{}
 	d.command = "flushdb"
 	d.updated = true
 	d.timestamp = time.Now()
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		res = resp.SimpleStringValue("OK")
 	}
@@ -543,7 +522,7 @@ func (server *Server) cmdFlushDB(msg *Message) (res resp.Value, d commandDetails
 func (server *Server) parseSetArgs(vs []string) (
 	d commandDetails, fields []string, values []float64,
 	xx, nx bool,
-	expires *float64, etype []byte, evs []string, err error,
+	ex int64, etype []byte, evs []string, err error,
 ) {
 	var ok bool
 	var typ []byte
@@ -590,7 +569,7 @@ func (server *Server) parseSetArgs(vs []string) (
 		}
 		if lcb(arg, "ex") {
 			vs = nvs
-			if expires != nil {
+			if ex != 0 {
 				err = errInvalidArgument(string(arg))
 				return
 			}
@@ -605,7 +584,7 @@ func (server *Server) parseSetArgs(vs []string) (
 				err = errInvalidArgument(s)
 				return
 			}
-			expires = &v
+			ex = time.Now().UnixNano() + int64(float64(time.Second)*v)
 			continue
 		}
 		if lcb(arg, "xx") {
@@ -771,7 +750,7 @@ func (server *Server) cmdSet(msg *Message) (res resp.Value, d commandDetails, er
 	var fields []string
 	var values []float64
 	var xx, nx bool
-	var ex *float64
+	var ex int64
 	d, fields, values, xx, nx, ex, _, _, err = server.parseSetArgs(vs)
 	if err != nil {
 		return
@@ -785,13 +764,12 @@ func (server *Server) cmdSet(msg *Message) (res resp.Value, d commandDetails, er
 		server.setCol(d.key, col)
 	}
 	if xx || nx {
-		_, _, ok := col.Get(d.id)
+		_, _, _, ok := col.Get(d.id)
 		if (nx && ok) || (xx && !ok) {
 			goto notok
 		}
 	}
-	server.clearIDExpires(d.key, d.id)
-	d.oldObj, d.oldFields, d.fields = col.Set(d.id, d.obj, fields, values)
+	d.oldObj, d.oldFields, d.fields = col.Set(d.id, d.obj, fields, values, ex)
 	d.command = "set"
 	d.updated = true // perhaps we should do a diff on the previous object?
 	d.timestamp = time.Now()
@@ -803,13 +781,13 @@ func (server *Server) cmdSet(msg *Message) (res resp.Value, d commandDetails, er
 			d.fmap[key] = idx
 		}
 	}
-	if ex != nil {
-		server.expireAt(d.key, d.id, d.timestamp.Add(time.Duration(float64(time.Second)*(*ex))))
-	}
+	// if ex != nil {
+	// 	server.expireAt(d.key, d.id, d.timestamp.Add(time.Duration(float64(time.Second)*(*ex))))
+	// }
 	switch msg.OutputType {
 	default:
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		res = resp.SimpleStringValue("OK")
 	}
@@ -910,7 +888,7 @@ func (server *Server) cmdFset(msg *Message) (res resp.Value, d commandDetails, e
 
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		res = resp.IntegerValue(updateCount)
 	}
@@ -947,17 +925,16 @@ func (server *Server) cmdExpire(msg *Message) (res resp.Value, d commandDetails,
 	ok = false
 	col := server.getCol(key)
 	if col != nil {
-		_, _, ok = col.Get(id)
-		ok = ok && !server.hasExpired(key, id)
+		ex := time.Now().Add(time.Duration(float64(time.Second) * value)).UnixNano()
+		ok = col.SetExpires(id, ex)
 	}
 	if ok {
-		server.expireAt(key, id, time.Now().Add(time.Duration(float64(time.Second)*value)))
 		d.updated = true
 	}
 	switch msg.OutputType {
 	case JSON:
 		if ok {
-			res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+			res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 		} else {
 			return resp.SimpleStringValue(""), d, errIDNotFound
 		}
@@ -992,10 +969,13 @@ func (server *Server) cmdPersist(msg *Message) (res resp.Value, d commandDetails
 	ok = false
 	col := server.getCol(key)
 	if col != nil {
-		_, _, ok = col.Get(id)
-		ok = ok && !server.hasExpired(key, id)
-		if ok {
-			cleared = server.clearIDExpires(key, id)
+		var ex int64
+		_, _, ex, ok = col.Get(id)
+		if ok && ex != 0 {
+			ok = col.SetExpires(id, 0)
+			if ok {
+				cleared = true
+			}
 		}
 	}
 	if !ok {
@@ -1009,7 +989,7 @@ func (server *Server) cmdPersist(msg *Message) (res resp.Value, d commandDetails
 	d.timestamp = time.Now()
 	switch msg.OutputType {
 	case JSON:
-		res = resp.SimpleStringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.SimpleStringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		if cleared {
 			res = resp.IntegerValue(1)
@@ -1042,19 +1022,19 @@ func (server *Server) cmdTTL(msg *Message) (res resp.Value, err error) {
 	var ok2 bool
 	col := server.getCol(key)
 	if col != nil {
-		_, _, ok = col.Get(id)
-		ok = ok && !server.hasExpired(key, id)
+		var ex int64
+		_, _, ex, ok = col.Get(id)
 		if ok {
-			var at time.Time
-			at, ok2 = server.getExpires(key, id)
-			if ok2 {
-				if time.Now().After(at) {
+			if ex != 0 {
+				now := start.UnixNano()
+				if now > ex {
 					ok2 = false
 				} else {
-					v = float64(at.Sub(time.Now())) / float64(time.Second)
+					v = float64(ex-now) / float64(time.Second)
 					if v < 0 {
 						v = 0
 					}
+					ok2 = true
 				}
 			}
 		}
@@ -1069,7 +1049,7 @@ func (server *Server) cmdTTL(msg *Message) (res resp.Value, err error) {
 				ttl = "-1"
 			}
 			res = resp.SimpleStringValue(
-				`{"ok":true,"ttl":` + ttl + `,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+				`{"ok":true,"ttl":` + ttl + `,"elapsed":"` + time.Since(start).String() + "\"}")
 		} else {
 			return resp.SimpleStringValue(""), errIDNotFound
 		}

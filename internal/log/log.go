@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var mu sync.Mutex
@@ -24,12 +24,17 @@ var Level = 1
 // SetOutput sets the output of the logger
 func SetOutput(w io.Writer) {
 	f, ok := w.(*os.File)
-	tty = ok && terminal.IsTerminal(int(f.Fd()))
+	tty = ok && term.IsTerminal(int(f.Fd()))
 	wr = w
 }
 
 func init() {
 	SetOutput(os.Stderr)
+}
+
+// Output retuns the output writer
+func Output() io.Writer {
+	return wr
 }
 
 func log(level int, tag, color string, formatted bool, format string, args ...interface{}) {

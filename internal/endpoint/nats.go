@@ -5,12 +5,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats.go"
 )
 
-const (
-	natsExpiresAfter = time.Second * 30
-)
+const natsExpiresAfter = time.Second * 30
 
 // NATSConn is an endpoint connection
 type NATSConn struct {
@@ -33,7 +31,7 @@ func (conn *NATSConn) Expired() bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	if !conn.ex {
-		if time.Now().Sub(conn.t) > natsExpiresAfter {
+		if time.Since(conn.t) > natsExpiresAfter {
 			if conn.conn != nil {
 				conn.close()
 			}
@@ -59,13 +57,21 @@ func (conn *NATSConn) Send(msg string) error {
 	}
 	conn.t = time.Now()
 	if conn.conn == nil {
-		addr := fmt.Sprintf("nats://%s:%d", conn.ep.NATS.Host, conn.ep.NATS.Port)
+		addr := fmt.Sprintf("%s:%d", conn.ep.NATS.Host, conn.ep.NATS.Port)
 		var err error
+		var opts []nats.Option
 		if conn.ep.NATS.User != "" && conn.ep.NATS.Pass != "" {
-			conn.conn, err = nats.Connect(addr, nats.UserInfo(conn.ep.NATS.User, conn.ep.NATS.Pass))
-		} else {
-			conn.conn, err = nats.Connect(addr)
+			opts = append(opts, nats.UserInfo(conn.ep.NATS.User, conn.ep.NATS.Pass))
 		}
+		if conn.ep.NATS.TLS {
+			opts = append(opts, nats.ClientCert(
+				conn.ep.NATS.TLSCert, conn.ep.NATS.TLSKey,
+			))
+		}
+		if conn.ep.NATS.Token != "" {
+			opts = append(opts, nats.Token(conn.ep.NATS.Token))
+		}
+		conn.conn, err = nats.Connect(addr, opts...)
 		if err != nil {
 			conn.close()
 			return err

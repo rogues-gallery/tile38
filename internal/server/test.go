@@ -216,7 +216,7 @@ func (s *Server) parseArea(ovs []string, doClip bool) (vs []string, o geojson.Ob
 			err = errKeyNotFound
 			return
 		}
-		o, _, ok = col.Get(id)
+		o, _, _, ok = col.Get(id)
 		if !ok {
 			err = errIDNotFound
 			return
@@ -231,8 +231,9 @@ func (s *Server) cmdTest(msg *Message) (res resp.Value, err error) {
 
 	var ok bool
 	var test string
-	var obj1, obj2, clipped geojson.Object
-	if vs, obj1, err = s.parseArea(vs, false); err != nil {
+	var clipped geojson.Object
+	var area1, area2 *areaExpression
+	if vs, area1, err = s.parseAreaExpression(vs, false); err != nil {
 		return
 	}
 	if vs, test, ok = tokenval(vs); !ok || test == "" {
@@ -259,23 +260,28 @@ func (s *Server) cmdTest(msg *Message) (res resp.Value, err error) {
 			doClip = true
 		}
 	}
-	if vs, obj2, err = s.parseArea(vs, doClip); err != nil {
+	if vs, area2, err = s.parseAreaExpression(vs, doClip); err != nil {
+		return
+	}
+	if doClip && (area1.obj == nil || area2.obj == nil) {
+		err = errInvalidArgument("clip")
 		return
 	}
 	if len(vs) != 0 {
 		err = errInvalidNumberOfArguments
+		return
 	}
 
 	var result int
 	if lTest == "within" {
-		if obj1.Within(obj2) {
+		if area1.WithinExpr(area2) {
 			result = 1
 		}
 	} else if lTest == "intersects" {
-		if obj1.Intersects(obj2) {
+		if area1.IntersectsExpr(area2) {
 			result = 1
 			if doClip {
-				clipped = clip.Clip(obj1, obj2)
+				clipped = clip.Clip(area1.obj, area2.obj, nil)
 			}
 		}
 	}
@@ -291,7 +297,7 @@ func (s *Server) cmdTest(msg *Message) (res resp.Value, err error) {
 		if clipped != nil {
 			buf.WriteString(`,"object":` + clipped.JSON())
 		}
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		if clipped != nil {

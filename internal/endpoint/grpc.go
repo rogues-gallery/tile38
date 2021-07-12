@@ -11,9 +11,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-const (
-	grpcExpiresAfter = time.Second * 30
-)
+const grpcExpiresAfter = time.Second * 30
 
 // GRPCConn is an endpoint connection
 type GRPCConn struct {
@@ -37,7 +35,7 @@ func (conn *GRPCConn) Expired() bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	if !conn.ex {
-		if time.Now().Sub(conn.t) > grpcExpiresAfter {
+		if time.Since(conn.t) > grpcExpiresAfter {
 			if conn.conn != nil {
 				conn.close()
 			}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -22,19 +23,22 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/tidwall/boxtree/d2"
+	"github.com/tidwall/btree"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/geojson"
 	"github.com/tidwall/geojson/geometry"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"
 	"github.com/tidwall/resp"
+	"github.com/tidwall/rtree"
 	"github.com/tidwall/tile38/core"
 	"github.com/tidwall/tile38/internal/collection"
 	"github.com/tidwall/tile38/internal/deadline"
 	"github.com/tidwall/tile38/internal/endpoint"
 	"github.com/tidwall/tile38/internal/expire"
 	"github.com/tidwall/tile38/internal/log"
-	"github.com/tidwall/tinybtree"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 var errOOM = errors.New("OOM command not allowed when used memory > 'maxmemory'")
@@ -79,6 +83,8 @@ type Server struct {
 
 	// env opts
 	geomParseOpts geojson.ParseOptions
+	geomIndexOpts geometry.IndexOptions
+	http500Errors bool
 
 	// atomics
 	followc            aint // counter increases when follow property changes
@@ -93,18 +99,14 @@ type Server struct {
 	connsmu sync.RWMutex
 	conns   map[int]*Client
 
-	exlistmu sync.RWMutex
-	exlist   []exitem
-
 	mu       sync.RWMutex
-	aof      *os.File                        // active aof file
-	aofdirty int32                           // mark the aofbuf as having data
-	aofbuf   []byte                          // prewrite buffer
-	aofsz    int                             // active size of the aof file
-	qdb      *buntdb.DB                      // hook queue log
-	qidx     uint64                          // hook queue log last idx
-	cols     tinybtree.BTree                 // data collections
-	expires  map[string]map[string]time.Time // synced with cols
+	aof      *os.File     // active aof file
+	aofdirty int32        // mark the aofbuf as having data
+	aofbuf   []byte       // prewrite buffer
+	aofsz    int          // active size of the aof file
+	qdb      *buntdb.DB   // hook queue log
+	qidx     uint64       // hook queue log last idx
+	cols     *btree.BTree // data collections
 
 	follows    map[*bytes.Buffer]bool
 	fcond      *sync.Cond
@@ -116,18 +118,22 @@ type Server struct {
 	shrinking  bool             // aof shrinking flag
 	shrinklog  [][]string       // aof shrinking log
 	hooks      map[string]*Hook // hook name
-	hookTree   d2.BoxTree       // hook spatial tree containing all
+	hookCross  rtree.RTree      // hook spatial tree for "cross" geofences
+	hookTree   rtree.RTree      // hook spatial tree for all
 	hooksOut   map[string]*Hook // hooks with "outside" detection
-	aofconnM   map[net.Conn]bool
+	aofconnM   map[net.Conn]io.Closer
 	luascripts *lScriptMap
 	luapool    *lStatePool
 
 	pubsub *pubsub
 	hookex expire.List
+
+	monconnsMu sync.RWMutex
+	monconns   map[net.Conn]bool // monitor connections
 }
 
 // Serve starts a new tile38 server
-func Serve(host string, port int, dir string, http bool) error {
+func Serve(host string, port int, dir string, useHTTP bool, metricsAddr string) error {
 	if core.AppendFileName == "" {
 		core.AppendFileName = path.Join(dir, "appendonly.aof")
 	}
@@ -147,12 +153,13 @@ func Serve(host string, port int, dir string, http bool) error {
 		lcond:    sync.NewCond(&sync.Mutex{}),
 		hooks:    make(map[string]*Hook),
 		hooksOut: make(map[string]*Hook),
-		aofconnM: make(map[net.Conn]bool),
-		expires:  make(map[string]map[string]time.Time),
+		aofconnM: make(map[net.Conn]io.Closer),
 		started:  time.Now(),
 		conns:    make(map[int]*Client),
-		http:     http,
+		http:     useHTTP,
 		pubsub:   newPubsub(),
+		monconns: make(map[net.Conn]bool),
+		cols:     btree.New(byCollectionKey),
 	}
 
 	server.hookex.Expired = func(item expire.Item) {
@@ -175,14 +182,20 @@ func Serve(host string, port int, dir string, http bool) error {
 		return err
 	}
 
+	// Send "500 Internal Server" error instead of "200 OK" for json responses
+	// with `"ok":false`. T38HTTP500ERRORS=1
+	server.http500Errors, _ = strconv.ParseBool(os.Getenv("T38HTTP500ERRORS"))
+
 	// Allow for geometry indexing options through environment variables:
 	// T38IDXGEOMKIND -- None, RTree, QuadTree
 	// T38IDXGEOM -- Min number of points in a geometry for indexing.
 	// T38IDXMULTI -- Min number of object in a Multi/Collection for indexing.
 	server.geomParseOpts = *geojson.DefaultParseOptions
+	server.geomIndexOpts = *geometry.DefaultIndexOptions
 	n, err := strconv.ParseUint(os.Getenv("T38IDXGEOM"), 10, 32)
 	if err == nil {
 		server.geomParseOpts.IndexGeometry = int(n)
+		server.geomIndexOpts.MinPoints = int(n)
 	}
 	n, err = strconv.ParseUint(os.Getenv("T38IDXMULTI"), 10, 32)
 	if err == nil {
@@ -199,10 +212,13 @@ func Serve(host string, port int, dir string, http bool) error {
 	case "":
 	case "None":
 		server.geomParseOpts.IndexGeometryKind = geometry.None
+		server.geomIndexOpts.Kind = geometry.None
 	case "RTree":
 		server.geomParseOpts.IndexGeometryKind = geometry.RTree
+		server.geomIndexOpts.Kind = geometry.RTree
 	case "QuadTree":
 		server.geomParseOpts.IndexGeometryKind = geometry.QuadTree
+		server.geomIndexOpts.Kind = geometry.QuadTree
 	}
 	if server.geomParseOpts.IndexGeometryKind == geometry.None {
 		log.Debugf("Geom indexing: %s",
@@ -245,7 +261,7 @@ func Serve(host string, port int, dir string, http bool) error {
 	if err := server.migrateAOF(); err != nil {
 		return err
 	}
-	if core.AppendOnly == true {
+	if core.AppendOnly {
 		f, err := os.OpenFile(core.AppendFileName, os.O_CREATE|os.O_RDWR, 0600)
 		if err != nil {
 			return err
@@ -259,13 +275,23 @@ func Serve(host string, port int, dir string, http bool) error {
 			server.aof.Sync()
 		}()
 	}
-	server.fillExpiresList()
+	// server.fillExpiresList()
 
 	// Start background routines
 	if server.config.followHost() != "" {
 		go server.follow(server.config.followHost(), server.config.followPort(),
 			server.followc.get())
 	}
+
+	if metricsAddr != "" {
+		log.Infof("Listening for metrics at: %s", metricsAddr)
+		go func() {
+			http.HandleFunc("/", server.MetricsIndexHandler)
+			http.HandleFunc("/metrics", server.MetricsHandler)
+			log.Fatal(http.ListenAndServe(metricsAddr, nil))
+		}()
+	}
+
 	go server.processLives()
 	go server.watchOutOfMemory()
 	go server.watchLuaStatePool()
@@ -350,6 +376,9 @@ func (server *Server) netServe() error {
 				conn.Close()
 			}()
 
+			var lastConnType Type
+			var lastOutputType Type
+
 			// check if the connection is protected
 			if !strings.HasPrefix(client.remoteAddr, "127.0.0.1:") &&
 				!strings.HasPrefix(client.remoteAddr, "[::1]:") {
@@ -378,10 +407,6 @@ func (server *Server) netServe() error {
 				pr.wr = client
 
 				msgs, err := pr.ReadMessages()
-				if err != nil {
-					log.Error(err)
-					return // close connection
-				}
 				for _, msg := range msgs {
 					// Just closing connection if we have deprecated HTTP or WS connection,
 					// And --http-transport = false
@@ -459,6 +484,8 @@ func (server *Server) netServe() error {
 						close = true // close connection
 						break
 					}
+					lastOutputType = msg.OutputType
+					lastConnType = msg.ConnType
 				}
 
 				packet = packet[len(packet)-rdbuf.Len():]
@@ -477,10 +504,25 @@ func (server *Server) netServe() error {
 					}
 					conn.Write(client.out)
 					client.out = nil
-
 				}
 				if close {
 					break
+				}
+				if err != nil {
+					log.Error(err)
+					if lastConnType == RESP {
+						var value resp.Value
+						switch lastOutputType {
+						case JSON:
+							value = resp.StringValue(`{"ok":false,"err":` +
+								jsonString(err.Error()) + "}")
+						case RESP:
+							value = resp.ErrorValue(err)
+						}
+						bytes, _ := value.MarshalRESP()
+						conn.Write(bytes)
+					}
+					break // close connection
 				}
 			}
 		}(conn)
@@ -535,7 +577,7 @@ func (server *Server) watchAutoGC() {
 		if autoGC == 0 {
 			continue
 		}
-		if time.Now().Sub(s) < time.Second*time.Duration(autoGC) {
+		if time.Since(s) < time.Second*time.Duration(autoGC) {
 			continue
 		}
 		var mem1, mem2 runtime.MemStats
@@ -600,21 +642,30 @@ func (server *Server) backgroundSyncAOF() {
 		func() {
 			server.mu.Lock()
 			defer server.mu.Unlock()
-			if len(server.aofbuf) > 0 {
-				server.flushAOF(true)
-			}
-			server.aofbuf = nil
+			server.flushAOF(true)
 		}()
 	}
 }
 
+// collectionKeyContainer is a wrapper object around a collection that includes
+// the collection and the key. It's needed for support with the btree package,
+// which requires a comparator less function.
+type collectionKeyContainer struct {
+	key string
+	col *collection.Collection
+}
+
+func byCollectionKey(a, b interface{}) bool {
+	return a.(*collectionKeyContainer).key < b.(*collectionKeyContainer).key
+}
+
 func (server *Server) setCol(key string, col *collection.Collection) {
-	server.cols.Set(key, col)
+	server.cols.Set(&collectionKeyContainer{key, col})
 }
 
 func (server *Server) getCol(key string) *collection.Collection {
-	if value, ok := server.cols.Get(key); ok {
-		return value.(*collection.Collection)
+	if v := server.cols.Get(&collectionKeyContainer{key: key}); v != nil {
+		return v.(*collectionKeyContainer).col
 	}
 	return nil
 }
@@ -622,14 +673,17 @@ func (server *Server) getCol(key string) *collection.Collection {
 func (server *Server) scanGreaterOrEqual(
 	key string, iterator func(key string, col *collection.Collection) bool,
 ) {
-	server.cols.Ascend(key, func(ikey string, ivalue interface{}) bool {
-		return iterator(ikey, ivalue.(*collection.Collection))
-	})
+	server.cols.Ascend(&collectionKeyContainer{key: key},
+		func(v interface{}) bool {
+			vcol := v.(*collectionKeyContainer)
+			return iterator(vcol.key, vcol.col)
+		},
+	)
 }
 
 func (server *Server) deleteCol(key string) *collection.Collection {
-	if prev, ok := server.cols.Delete(key); ok {
-		return prev.(*collection.Collection)
+	if v := server.cols.Delete(&collectionKeyContainer{key: key}); v != nil {
+		return v.(*collectionKeyContainer).col
 	}
 	return nil
 }
@@ -686,11 +740,16 @@ func (server *Server) handleInputCommand(client *Client, msg *Message) error {
 		case WebSocket:
 			return WriteWebSocketMessage(client, []byte(res))
 		case HTTP:
-			_, err := fmt.Fprintf(client, "HTTP/1.1 200 OK\r\n"+
+			status := "200 OK"
+			if (server.http500Errors || msg._command == "healthz") &&
+				!gjson.Get(res, "ok").Bool() {
+				status = "500 Internal Server Error"
+			}
+			_, err := fmt.Fprintf(client, "HTTP/1.1 %s\r\n"+
 				"Connection: close\r\n"+
 				"Content-Length: %d\r\n"+
 				"Content-Type: application/json; charset=utf-8\r\n"+
-				"\r\n", len(res)+2)
+				"\r\n", status, len(res)+2)
 			if err != nil {
 				return err
 			}
@@ -714,14 +773,20 @@ func (server *Server) handleInputCommand(client *Client, msg *Message) error {
 		}
 	}
 
+	cmd := msg.Command()
+	defer func() {
+		took := time.Since(start).Seconds()
+		cmdDurations.With(prometheus.Labels{"cmd": cmd}).Observe(took)
+	}()
+
 	// Ping. Just send back the response. No need to put through the pipeline.
-	if msg.Command() == "ping" || msg.Command() == "echo" {
+	if cmd == "ping" || cmd == "echo" {
 		switch msg.OutputType {
 		case JSON:
 			if len(msg.Args) > 1 {
-				return writeOutput(`{"ok":true,"` + msg.Command() + `":` + jsonString(msg.Args[1]) + `,"elapsed":"` + time.Now().Sub(start).String() + `"}`)
+				return writeOutput(`{"ok":true,"` + cmd + `":` + jsonString(msg.Args[1]) + `,"elapsed":"` + time.Since(start).String() + `"}`)
 			}
-			return writeOutput(`{"ok":true,"` + msg.Command() + `":"pong","elapsed":"` + time.Now().Sub(start).String() + `"}`)
+			return writeOutput(`{"ok":true,"` + cmd + `":"pong","elapsed":"` + time.Since(start).String() + `"}`)
 		case RESP:
 			if len(msg.Args) > 1 {
 				data := redcon.AppendBulkString(nil, msg.Args[1])
@@ -729,16 +794,17 @@ func (server *Server) handleInputCommand(client *Client, msg *Message) error {
 			}
 			return writeOutput("+PONG\r\n")
 		}
+		server.sendMonitor(nil, msg, client, false)
 		return nil
 	}
 
 	writeErr := func(errMsg string) error {
 		switch msg.OutputType {
 		case JSON:
-			return writeOutput(`{"ok":false,"err":` + jsonString(errMsg) + `,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+			return writeOutput(`{"ok":false,"err":` + jsonString(errMsg) + `,"elapsed":"` + time.Since(start).String() + "\"}")
 		case RESP:
 			if errMsg == errInvalidNumberOfArguments.Error() {
-				return writeOutput("-ERR wrong number of arguments for '" + msg.Command() + "' command\r\n")
+				return writeOutput("-ERR wrong number of arguments for '" + cmd + "' command\r\n")
 			}
 			v, _ := resp.ErrorValue(errors.New("ERR " + errMsg)).MarshalRESP()
 			return writeOutput(string(v))
@@ -746,7 +812,7 @@ func (server *Server) handleInputCommand(client *Client, msg *Message) error {
 		return nil
 	}
 
-	if msg.Command() == "timeout" {
+	if cmd == "timeout" {
 		if err := rewriteTimeoutMsg(msg); err != nil {
 			return writeErr(err.Error())
 		}
@@ -754,11 +820,11 @@ func (server *Server) handleInputCommand(client *Client, msg *Message) error {
 
 	var write bool
 
-	if !client.authd || msg.Command() == "auth" {
+	if (!client.authd || cmd == "auth") && cmd != "output" {
 		if server.config.requirePass() != "" {
 			password := ""
 			// This better be an AUTH command or the Message should contain an Auth
-			if msg.Command() != "auth" && msg.Auth == "" {
+			if cmd != "auth" && msg.Auth == "" {
 				// Just shut down the pipeline now. The less the client connection knows the better.
 				return writeErr("authentication required")
 			}
@@ -813,7 +879,7 @@ func (server *Server) handleInputCommand(client *Client, msg *Message) error {
 		}
 	case "get", "keys", "scan", "nearby", "within", "intersects", "hooks",
 		"chans", "search", "ttl", "bounds", "server", "info", "type", "jget",
-		"evalro", "evalrosha":
+		"evalro", "evalrosha", "healthz":
 		// read operations
 
 		server.mu.RLock()
@@ -831,8 +897,6 @@ func (server *Server) handleInputCommand(client *Client, msg *Message) error {
 	case "echo":
 	case "massinsert":
 		// dev operation
-		server.mu.Lock()
-		defer server.mu.Unlock()
 	case "sleep":
 		// dev operation
 		server.mu.RLock()
@@ -851,6 +915,8 @@ func (server *Server) handleInputCommand(client *Client, msg *Message) error {
 		// No locking for scripts, otherwise writes cannot happen within scripts
 	case "subscribe", "psubscribe", "publish":
 		// No locking for pubsub
+	case "monitor":
+		// No locking for monitor
 	}
 	res, d, err := func() (res resp.Value, d commandDetails, err error) {
 		if msg.Deadline != nil {
@@ -923,11 +989,7 @@ func randomKey(n int) string {
 
 func (server *Server) reset() {
 	server.aofsz = 0
-	server.cols = tinybtree.BTree{}
-	server.exlistmu.Lock()
-	server.exlist = nil
-	server.exlistmu.Unlock()
-	server.expires = make(map[string]map[string]time.Time)
+	server.cols = btree.New(byCollectionKey)
 }
 
 func (server *Server) command(msg *Message, client *Client) (
@@ -1002,6 +1064,8 @@ func (server *Server) command(msg *Message, client *Client) (
 		res, err = server.cmdStats(msg)
 	case "server":
 		res, err = server.cmdServer(msg)
+	case "healthz":
+		res, err = server.cmdHealthz(msg)
 	case "info":
 		res, err = server.cmdInfo(msg)
 	case "scan":
@@ -1076,7 +1140,10 @@ func (server *Server) command(msg *Message, client *Client) (
 		res, err = server.cmdPublish(msg)
 	case "test":
 		res, err = server.cmdTest(msg)
+	case "monitor":
+		res, err = server.cmdMonitor(msg)
 	}
+	server.sendMonitor(err, msg, client, false)
 	return
 }
 
@@ -1098,19 +1165,6 @@ started the server manually just for testing, restart it with the
 password. NOTE: You only need to do one of the above things in order for the
 server to start accepting connections from the outside.
 `), "\n", " ", -1) + "\r\n")
-
-// SetKeepAlive sets the connection keepalive
-func setKeepAlive(conn net.Conn, period time.Duration) error {
-	if tcp, ok := conn.(*net.TCPConn); ok {
-		if err := tcp.SetKeepAlive(true); err != nil {
-			return err
-		}
-		return tcp.SetKeepAlivePeriod(period)
-	}
-	return nil
-}
-
-var errCloseHTTP = errors.New("close http")
 
 // WriteWebSocketMessage write a websocket message to an io.Writer.
 func WriteWebSocketMessage(w io.Writer, data []byte) error {
@@ -1140,7 +1194,7 @@ func WriteWebSocketMessage(w io.Writer, data []byte) error {
 func OKMessage(msg *Message, start time.Time) resp.Value {
 	switch msg.OutputType {
 	case JSON:
-		return resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		return resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		return resp.SimpleStringValue("OK")
 	}
@@ -1361,8 +1415,10 @@ moreData:
 	}
 	for len(data) > 0 {
 		msg := &Message{}
-		complete, args, kind, leftover, err := readNextCommand(data, nil, msg, rd.wr)
-		if err != nil {
+		complete, args, kind, leftover, err2 :=
+			readNextCommand(data, nil, msg, rd.wr)
+		if err2 != nil {
+			err = err2
 			break
 		}
 		if !complete {
@@ -1397,10 +1453,7 @@ moreData:
 	} else if len(rd.buf) > 0 {
 		rd.buf = rd.buf[:0]
 	}
-	if err != nil && len(msgs) == 0 {
-		return nil, err
-	}
-	return msgs, nil
+	return msgs, err
 }
 
 func readNativeMessageLine(line []byte) (*Message, error) {
@@ -1464,4 +1517,12 @@ func (is *InputStream) End(data []byte) {
 	} else if len(is.b) > 0 {
 		is.b = is.b[:0]
 	}
+}
+
+// clientErrorf is the same as fmt.Errorf, but is intented for errors that are
+// sent back to the client. This allows for the Go static checker to ignore
+// throwing warning for certain error strings.
+// https://staticcheck.io/docs/checks#ST1005
+func clientErrorf(format string, args ...interface{}) error {
+	return fmt.Errorf(format, args...)
 }

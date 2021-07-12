@@ -1,12 +1,10 @@
 <p align="center">
   <a href="https://tile38.com"><img 
-    src="/internal/assets/logo.png" 
-    width="284" height="108" border="0" alt="Tile38"></a>
+    src="/.github/images/logo-light.svg" 
+    width="284" border="0" alt="Tile38"></a>
 </p>
 <p align="center">
-<a href="https://join.slack.com/t/tile38/shared_invite/enQtMzQ0OTEwMDUxMzc5LTc0NTJjZmM3YjFhOGZiZGU2NDNjOWEwM2Q5ZWE3MzFiYWZkZDIyN2U2ZmUzZDBmODU0MjI1ZjQ0N2Y1M2I1NTg"><img src="https://img.shields.io/badge/slack-channel-orange.svg" alt="Slack Channel"></a>
-<a href="https://github.com/tidwall/tile38/releases"><img src="https://img.shields.io/badge/version-1.17.2-green.svg?" alt="Version"></a>
-<a href="https://travis-ci.org/tidwall/tile38"><img src="https://travis-ci.org/tidwall/tile38.svg?branch=master" alt="Build Status"></a>
+<a href="https://tile38.com/slack/"><img src="https://img.shields.io/badge/slack-channel-orange.svg" alt="Slack Channel"></a>
 <a href="https://hub.docker.com/r/tile38/tile38"><img src="https://img.shields.io/badge/docker-ready-blue.svg" alt="Docker Ready"></a>
 </p>
 
@@ -14,11 +12,11 @@ Tile38 is an open source (MIT licensed), in-memory geolocation data store, spati
 
 <p align="center">
 <i>This README is quick start document. You can find detailed documentation at <a href="https://tile38.com">https://tile38.com</a>.</i><br><br>
-<a href="#searching"><img src="/internal/assets/search-nearby.png" alt="Nearby" border="0" width="120" height="120"></a>
-<a href="#searching"><img src="/internal/assets/search-within.png" alt="Within" border="0" width="120" height="120"></a>
-<a href="#searching"><img src="/internal/assets/search-intersects.png" alt="Intersects" border="0" width="120" height="120"></a>
-<a href="https://tile38.com/topics/geofencing"><img src="/internal/assets/geofence.gif" alt="Geofencing" border="0" width="120" height="120"></a>
-<a href="https://tile38.com/topics/roaming-geofences"><img src="/internal/assets/roaming.gif" alt="Roaming Geofences" border="0" width="120" height="120"></a>
+<a href="#searching"><img src="/.github/images/search-nearby.png" alt="Nearby" border="0" width="120" height="120"></a>
+<a href="#searching"><img src="/.github/images/search-within.png" alt="Within" border="0" width="120" height="120"></a>
+<a href="#searching"><img src="/.github/images/search-intersects.png" alt="Intersects" border="0" width="120" height="120"></a>
+<a href="https://tile38.com/topics/geofencing"><img src="/.github/images/geofence.gif" alt="Geofencing" border="0" width="120" height="120"></a>
+<a href="https://tile38.com/topics/roaming-geofences"><img src="/.github/images/roaming.gif" alt="Roaming Geofences" border="0" width="120" height="120"></a>
 </p>
 
 ## Features
@@ -26,7 +24,7 @@ Tile38 is an open source (MIT licensed), in-memory geolocation data store, spati
 - Spatial index with [search](#searching) methods such as Nearby, Within, and Intersects.
 - Realtime [geofencing](#geofencing) through [webhooks](https://tile38.com/commands/sethook) or [pub/sub channels](#pubsub-channels).
 - Object types of [lat/lon](#latlon-point), [bbox](#bounding-box), [Geohash](#geohash), [GeoJSON](#geojson), [QuadKey](#quadkey), and [XYZ tile](#xyz-tile).
-- Support for lots of [Clients Libraries](#client-libraries) written in many different languages.
+- Support for lots of [Clients Libraries](#tile38-client-libraries) written in many different languages.
 - Variety of protocols, including [http](#http) (curl), [websockets](#websockets), [telnet](#telnet), and the [Redis RESP](https://redis.io/topics/protocol).
 - Server responses are [RESP](https://redis.io/topics/protocol) or [JSON](https://www.json.org).
 - Full [command line interface](#cli).
@@ -94,6 +92,20 @@ $ ./tile38-cli
 > help
 ```
 
+#### Prometheus Metrics
+Tile38 can natively export Prometheus metrics by setting the `--metrics-addr` command line flag (disabled by default). This example exposes the HTTP metrics server on port 4321:
+```
+# start server and enable Prometheus metrics, listen on local interface only
+./tile38-server --metrics-addr=127.0.0.1:4321
+
+# access metrics
+curl http://127.0.0.1:4321/metrics
+```
+If you need to access the `/metrics` endpoint from a different host you'll have to set the flag accordingly, e.g. set it to `0.0.0.0:<<port>>` to listen on all interfaces.
+
+Use the [redis_exporter](https://github.com/oliver006/redis_exporter) for more advanced use cases like extracting key values or running a lua script.
+
+
 ## <a name="cli"></a>Playing with Tile38
 
 Basic operations:
@@ -134,19 +146,19 @@ To set a field when an object already exists:
 
 Tile38 has support to search for objects and points that are within or intersects other objects. All object types can be searched including Polygons, MultiPolygons, GeometryCollections, etc.
 
-<img src="/internal/assets/search-within.png" width="200" height="200" border="0" alt="Search Within" align="left">
+<img src="/.github/images/search-within.png" width="200" height="200" border="0" alt="Search Within" align="left">
 
 #### Within 
 WITHIN searches a collection for objects that are fully contained inside a specified bounding area.
 <BR CLEAR="ALL">
 
-<img src="/internal/assets/search-intersects.png" width="200" height="200" border="0" alt="Search Intersects" align="left">
+<img src="/.github/images/search-intersects.png" width="200" height="200" border="0" alt="Search Intersects" align="left">
 
 #### Intersects
 INTERSECTS searches a collection for objects that intersect a specified bounding area.
 <BR CLEAR="ALL">
 
-<img src="/internal/assets/search-nearby.png" width="200" height="200" border="0" alt="Search Nearby" align="left">
+<img src="/.github/images/search-nearby.png" width="200" height="200" border="0" alt="Search Nearby" align="left">
 
 #### Nearby
 NEARBY searches a collection for objects that intersect a specified radius.
@@ -157,12 +169,12 @@ NEARBY searches a collection for objects that intersect a specified radius.
 This is very helpful for example; when you have many (perhaps millions) of objects and do not want them all clustered together on a map. Sparse will limit the number of objects returned and provide them evenly distributed so that your map looks clean.<br><br>
 You can choose a value between 1 and 8. The value 1 will result in no more than 4 items. The value 8 will result in no more than 65536. *1=4, 2=16, 3=64, 4=256, 5=1024, 6=4098, 7=16384, 8=65536.*<br><br>
 <table>
-<td>No Sparsing<img src="/internal/assets/sparse-none.png" width="100" height="100" border="0" alt="Search Within"></td>
-<td>Sparse 1<img src="/internal/assets/sparse-1.png" width="100" height="100" border="0" alt="Search Within"></td>
-<td>Sparse 2<img src="/internal/assets/sparse-2.png" width="100" height="100" border="0" alt="Search Within"></td>
-<td>Sparse 3<img src="/internal/assets/sparse-3.png" width="100" height="100" border="0" alt="Search Within"></td>
-<td>Sparse 4<img src="/internal/assets/sparse-4.png" width="100" height="100" border="0" alt="Search Within"></td>
-<td>Sparse 5<img src="/internal/assets/sparse-5.png" width="100" height="100" border="0" alt="Search Within"></td>
+<td>No Sparsing<img src="/.github/images/sparse-none.png" width="100" height="100" border="0" alt="Search Within"></td>
+<td>Sparse 1<img src="/.github/images/sparse-1.png" width="100" height="100" border="0" alt="Search Within"></td>
+<td>Sparse 2<img src="/.github/images/sparse-2.png" width="100" height="100" border="0" alt="Search Within"></td>
+<td>Sparse 3<img src="/.github/images/sparse-3.png" width="100" height="100" border="0" alt="Search Within"></td>
+<td>Sparse 4<img src="/.github/images/sparse-4.png" width="100" height="100" border="0" alt="Search Within"></td>
+<td>Sparse 5<img src="/.github/images/sparse-5.png" width="100" height="100" border="0" alt="Search Within"></td>
 </table>
 
 *Please note that the higher the sparse value, the slower the performance. Also, LIMIT and CURSOR are not available when using SPARSE.* 
@@ -180,7 +192,7 @@ You can choose a value between 1 and 8. The value 1 will result in no more than 
 
 ## Geofencing
 
-<img src="/internal/assets/geofence.gif" width="200" height="200" border="0" alt="Geofence animation" align="left">
+<img src="/.github/images/geofence.gif" width="200" height="200" border="0" alt="Geofence animation" align="left">
 A <a href="https://en.wikipedia.org/wiki/Geo-fence">geofence</a> is a virtual boundary that can detect when an object enters or exits the area. This boundary can be a radius, bounding box, or a polygon. Tile38 can turn any standard search into a geofence monitor by adding the FENCE keyword to the search. 
 
 *Tile38 also allows for [Webhooks](https://tile38.com/commands/sethook) to be assigned to Geofences.*
@@ -277,10 +289,9 @@ Check out [maptiler.org](http://www.maptiler.org/google-maps-coordinates-tile-bo
 #### QuadKey
 A QuadKey used the same coordinate system as an XYZ tile except that the string representation is a string characters composed of 0, 1, 2, or 3. For a detailed explanation checkout [The Bing Maps Tile System](https://msdn.microsoft.com/en-us/library/bb259689.aspx).
 
-
 ## Network protocols
 
-It's recommended to use a [client library](#client-libraries) or the [Tile38 CLI](#running), but there are times when only HTTP is available or when you need to test from a remote terminal. In those cases we provide an HTTP and telnet options.
+It's recommended to use a [client library](#tile38-client-libraries) or the [Tile38 CLI](#running), but there are times when only HTTP is available or when you need to test from a remote terminal. In those cases we provide an HTTP and telnet options.
 
 #### HTTP
 One of the simplest ways to call a tile38 command is to use HTTP. From the command line you can use [curl](https://curl.haxx.se/). For example:
@@ -311,9 +322,25 @@ The server will respond in [JSON](https://json.org) or [RESP](https://redis.io/t
 - HTTP and Websockets use JSON. 
 - Telnet and RESP clients use RESP.
 
-## Client Libraries
+## Tile38 Client Libraries
 
-Tile38 uses the [Redis RESP](https://redis.io/topics/protocol) protocol natively. Therefore most clients that support basic Redis commands will in turn support Tile38. Below are a few of the popular clients. 
+The following clients are built specifically for Tile38.  
+Clients that support most Tile38 features are marked with a ⭐️.
+
+- ⭐️ Go: [xjem/t38c](https://github.com/xjem/t38c)
+- ⭐️ Node.js: [node-tile38](https://github.com/phulst/node-tile38) ([example code](https://github.com/tidwall/tile38/wiki/Node.js-example-(node-tile38)))
+- ⭐️ Python: [pyle38](https://github.com/iwpnd/pyle38)
+- Go: [cjkreklow/t38c](https://github.com/cjkreklow/t38c)
+- Python: [pytile38](https://github.com/mitghi/pytile38)
+- Rust: [nazar](https://github.com/younisshah/nazar)
+- Swift: [Talon](https://github.com/mikekinney/Talon)
+- Java: [tile38-client-java](https://github.com/jamshidrostami/tile38-client-java)
+- Java: [tile38-client](https://github.com/HkMoyun/tile38-client)
+
+## Redis Client Libraries
+
+Tile38 uses the [Redis RESP](https://redis.io/topics/protocol) protocol natively. 
+Therefore most clients that support basic Redis commands will also support Tile38.
 
 - C: [hiredis](https://github.com/redis/hiredis)
 - C#: [StackExchange.Redis](https://github.com/StackExchange/StackExchange.Redis)
@@ -325,7 +352,6 @@ Tile38 uses the [Redis RESP](https://redis.io/topics/protocol) protocol natively
 - Go: [redigo](https://github.com/gomodule/redigo) ([example code](https://github.com/tidwall/tile38/wiki/Go-example-(redigo)))
 - Haskell: [hedis](https://github.com/informatikr/hedis)
 - Java: [lettuce](https://github.com/mp911de/lettuce) ([example code](https://github.com/tidwall/tile38/wiki/Java-example-(lettuce)))
-- Node.js: [node-tile38](https://github.com/phulst/node-tile38) ([example code](https://github.com/tidwall/tile38/wiki/Node.js-example-(node-tile38)))
 - Node.js: [node_redis](https://github.com/NodeRedis/node_redis) ([example code](https://github.com/tidwall/tile38/wiki/Node.js-example-(node-redis)))
 - Perl: [perl-redis](https://github.com/PerlRedis/perl-redis)
 - PHP: [tinyredisclient](https://github.com/ptrofimov/tinyredisclient) ([example code](https://github.com/tidwall/tile38/wiki/PHP-example-(tinyredisclient)))

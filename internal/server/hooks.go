@@ -36,7 +36,7 @@ func (a hooksByName) Swap(i, j int) {
 	a[i], a[j] = a[j], a[i]
 }
 
-func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
+func (s *Server) cmdSetHook(msg *Message, chanCmd bool) (
 	res resp.Value, d commandDetails, err error,
 ) {
 	start := time.Now()
@@ -55,7 +55,7 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 		}
 		for _, url := range strings.Split(urls, ",") {
 			url = strings.TrimSpace(url)
-			err := c.epc.Validate(url)
+			err := s.epc.Validate(url)
 			if err != nil {
 				log.Errorf("sethook: %v", err)
 				return resp.SimpleStringValue(""), d, errInvalidArgument(url)
@@ -108,15 +108,17 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 		}
 		break
 	}
-	s, err := c.cmdSearchArgs(true, cmdlc, vs, types)
-	defer s.Close()
+	args, err := s.cmdSearchArgs(true, cmdlc, vs, types)
+	if args.usingLua() {
+		defer args.Close()
+	}
 	if err != nil {
 		return NOMessage, d, err
 	}
-	if !s.fence {
+	if !args.fence {
 		return NOMessage, d, errors.New("missing FENCE argument")
 	}
-	s.cmd = cmdlc
+	args.cmd = cmdlc
 	cmsg := &Message{}
 	*cmsg = *msg
 	cmsg.Args = make([]string, len(commandvs))
@@ -130,33 +132,34 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 	sort.Sort(hookMetaByName(metas))
 
 	hook := &Hook{
-		Key:       s.key,
+		Key:       args.key,
 		Name:      name,
 		Endpoints: endpoints,
-		Fence:     &s,
+		Fence:     &args,
 		Message:   cmsg,
-		epm:       c.epc,
+		epm:       s.epc,
 		Metas:     metas,
 		channel:   chanCmd,
 		cond:      sync.NewCond(&sync.Mutex{}),
-		counter:   &c.statsTotalMsgsSent,
+		counter:   &s.statsTotalMsgsSent,
 	}
 	if expiresSet {
 		hook.expires =
 			time.Now().Add(time.Duration(expires * float64(time.Second)))
 	}
 	if !chanCmd {
-		hook.db = c.qdb
+		hook.db = s.qdb
 	}
 	var wr bytes.Buffer
-	hook.ScanWriter, err = c.newScanWriter(
-		&wr, cmsg, s.key, s.output, s.precision, s.glob, false,
-		s.cursor, s.limit, s.wheres, s.whereins, s.whereevals, s.nofields)
+	hook.ScanWriter, err = s.newScanWriter(
+		&wr, cmsg, args.key, args.output, args.precision, args.glob, false,
+		args.cursor, args.limit, args.wheres, args.whereins, args.whereevals,
+		args.nofields)
 	if err != nil {
 
 		return NOMessage, d, err
 	}
-	prevHook := c.hooks[name]
+	prevHook := s.hooks[name]
 	if prevHook != nil {
 		if prevHook.channel != chanCmd {
 			return NOMessage, d,
@@ -167,7 +170,7 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 			// for good measure.
 			prevHook.Signal()
 			if !hook.expires.IsZero() {
-				c.hookex.Push(hook)
+				s.hookex.Push(hook)
 			}
 			switch msg.OutputType {
 			case JSON:
@@ -177,38 +180,50 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 			}
 		}
 		prevHook.Close()
-		delete(c.hooks, name)
-		delete(c.hooksOut, name)
+		delete(s.hooks, name)
+		delete(s.hooksOut, name)
 	}
 
 	d.updated = true
 	d.timestamp = time.Now()
 
-	c.hooks[name] = hook
+	s.hooks[name] = hook
 	if hook.Fence.detect == nil || hook.Fence.detect["outside"] {
-		c.hooksOut[name] = hook
+		s.hooksOut[name] = hook
 	}
 
 	// remove previous hook from spatial index
 	if prevHook != nil && prevHook.Fence != nil && prevHook.Fence.obj != nil {
 		rect := prevHook.Fence.obj.Rect()
-		c.hookTree.Delete(
-			[]float64{rect.Min.X, rect.Min.Y},
-			[]float64{rect.Max.X, rect.Max.Y},
+		s.hookTree.Delete(
+			[2]float64{rect.Min.X, rect.Min.Y},
+			[2]float64{rect.Max.X, rect.Max.Y},
 			prevHook)
+		if prevHook.Fence.detect["cross"] {
+			s.hookCross.Delete(
+				[2]float64{rect.Min.X, rect.Min.Y},
+				[2]float64{rect.Max.X, rect.Max.Y},
+				prevHook)
+		}
 	}
 	// add hook to spatial index
 	if hook != nil && hook.Fence != nil && hook.Fence.obj != nil {
 		rect := hook.Fence.obj.Rect()
-		c.hookTree.Insert(
-			[]float64{rect.Min.X, rect.Min.Y},
-			[]float64{rect.Max.X, rect.Max.Y},
+		s.hookTree.Insert(
+			[2]float64{rect.Min.X, rect.Min.Y},
+			[2]float64{rect.Max.X, rect.Max.Y},
 			hook)
+		if hook.Fence.detect["cross"] {
+			s.hookCross.Insert(
+				[2]float64{rect.Min.X, rect.Min.Y},
+				[2]float64{rect.Max.X, rect.Max.Y},
+				hook)
+		}
 	}
 
 	hook.Open() // Opens a goroutine to notify the hook
 	if !hook.expires.IsZero() {
-		c.hookex.Push(hook)
+		s.hookex.Push(hook)
 	}
 	switch msg.OutputType {
 	case JSON:
@@ -219,7 +234,7 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 	return NOMessage, d, nil
 }
 
-func (c *Server) cmdDelHook(msg *Message, chanCmd bool) (
+func (s *Server) cmdDelHook(msg *Message, chanCmd bool) (
 	res resp.Value, d commandDetails, err error,
 ) {
 	start := time.Now()
@@ -233,18 +248,24 @@ func (c *Server) cmdDelHook(msg *Message, chanCmd bool) (
 	if len(vs) != 0 {
 		return NOMessage, d, errInvalidNumberOfArguments
 	}
-	if hook, ok := c.hooks[name]; ok && hook.channel == chanCmd {
+	if hook, ok := s.hooks[name]; ok && hook.channel == chanCmd {
 		hook.Close()
 		// remove hook from maps
-		delete(c.hooks, hook.Name)
-		delete(c.hooksOut, hook.Name)
+		delete(s.hooks, hook.Name)
+		delete(s.hooksOut, hook.Name)
 		// remove hook from spatial index
-		if hook != nil && hook.Fence != nil && hook.Fence.obj != nil {
+		if hook.Fence != nil && hook.Fence.obj != nil {
 			rect := hook.Fence.obj.Rect()
-			c.hookTree.Delete(
-				[]float64{rect.Min.X, rect.Min.Y},
-				[]float64{rect.Max.X, rect.Max.Y},
+			s.hookTree.Delete(
+				[2]float64{rect.Min.X, rect.Min.Y},
+				[2]float64{rect.Max.X, rect.Max.Y},
 				hook)
+			if hook.Fence.detect["cross"] {
+				s.hookCross.Delete(
+					[2]float64{rect.Min.X, rect.Min.Y},
+					[2]float64{rect.Max.X, rect.Max.Y},
+					hook)
+			}
 		}
 		d.updated = true
 	}
@@ -262,7 +283,7 @@ func (c *Server) cmdDelHook(msg *Message, chanCmd bool) (
 	return
 }
 
-func (c *Server) cmdPDelHook(msg *Message, channel bool) (
+func (s *Server) cmdPDelHook(msg *Message, channel bool) (
 	res resp.Value, d commandDetails, err error,
 ) {
 	start := time.Now()
@@ -278,7 +299,7 @@ func (c *Server) cmdPDelHook(msg *Message, channel bool) (
 	}
 
 	count := 0
-	for name, hook := range c.hooks {
+	for name, hook := range s.hooks {
 		if hook.channel != channel {
 			continue
 		}
@@ -288,15 +309,21 @@ func (c *Server) cmdPDelHook(msg *Message, channel bool) (
 		}
 		hook.Close()
 		// remove hook from maps
-		delete(c.hooks, hook.Name)
-		delete(c.hooksOut, hook.Name)
+		delete(s.hooks, hook.Name)
+		delete(s.hooksOut, hook.Name)
 		// remove hook from spatial index
-		if hook != nil && hook.Fence != nil && hook.Fence.obj != nil {
+		if hook.Fence != nil && hook.Fence.obj != nil {
 			rect := hook.Fence.obj.Rect()
-			c.hookTree.Delete(
-				[]float64{rect.Min.X, rect.Min.Y},
-				[]float64{rect.Max.X, rect.Max.Y},
+			s.hookTree.Delete(
+				[2]float64{rect.Min.X, rect.Min.Y},
+				[2]float64{rect.Max.X, rect.Max.Y},
 				hook)
+			if hook.Fence.detect["cross"] {
+				s.hookCross.Delete(
+					[2]float64{rect.Min.X, rect.Min.Y},
+					[2]float64{rect.Max.X, rect.Max.Y},
+					hook)
+			}
 		}
 		d.updated = true
 		count++
@@ -315,9 +342,9 @@ func (c *Server) cmdPDelHook(msg *Message, channel bool) (
 // possiblyExpireHook will evaluate a hook by it's name for expiration and
 // purge it from the database if needed. This operation is called from an
 // independent goroutine
-func (c *Server) possiblyExpireHook(name string) {
-	c.mu.Lock()
-	if h, ok := c.hooks[name]; ok {
+func (s *Server) possiblyExpireHook(name string) {
+	s.mu.Lock()
+	if h, ok := s.hooks[name]; ok {
 		if !h.expires.IsZero() && time.Now().After(h.expires) {
 			// purge from database
 			msg := &Message{}
@@ -326,22 +353,22 @@ func (c *Server) possiblyExpireHook(name string) {
 			} else {
 				msg.Args = []string{"delhook", h.Name}
 			}
-			_, d, err := c.cmdDelHook(msg, h.channel)
+			_, d, err := s.cmdDelHook(msg, h.channel)
 			if err != nil {
-				c.mu.Unlock()
+				s.mu.Unlock()
 				panic(err)
 			}
-			if err := c.writeAOF(msg.Args, &d); err != nil {
-				c.mu.Unlock()
+			if err := s.writeAOF(msg.Args, &d); err != nil {
+				s.mu.Unlock()
 				panic(err)
 			}
 			log.Debugf("purged hook %v", h.Name)
 		}
 	}
-	c.mu.Unlock()
+	s.mu.Unlock()
 }
 
-func (c *Server) cmdHooks(msg *Message, channel bool) (
+func (s *Server) cmdHooks(msg *Message, channel bool) (
 	res resp.Value, err error,
 ) {
 	start := time.Now()
@@ -358,7 +385,7 @@ func (c *Server) cmdHooks(msg *Message, channel bool) (
 	}
 
 	var hooks []*Hook
-	for name, hook := range c.hooks {
+	for name, hook := range s.hooks {
 		if hook.channel != channel {
 			continue
 		}
@@ -393,8 +420,9 @@ func (c *Server) cmdHooks(msg *Message, channel bool) (
 					}
 					buf.WriteString(jsonString(endpoint))
 				}
+				buf.WriteString(`]`)
 			}
-			buf.WriteString(`],"command":[`)
+			buf.WriteString(`,"command":[`)
 			for i, v := range hook.Message.Args {
 				if i > 0 {
 					buf.WriteString(`,`)
@@ -413,7 +441,7 @@ func (c *Server) cmdHooks(msg *Message, channel bool) (
 			buf.WriteString(`}}`)
 		}
 		buf.WriteString(`],"elapsed":"` +
-			time.Now().Sub(start).String() + "\"}")
+			time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		var vals []resp.Value
