@@ -1,25 +1,21 @@
 package endpoint
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tidwall/gjson"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
-	"github.com/streadway/amqp"
 	"github.com/tidwall/tile38/internal/log"
 )
 
-var errCreateQueue = errors.New("Error while creating queue")
-
-const (
-	sqsExpiresAfter = time.Second * 30
-)
+const sqsExpiresAfter = time.Second * 30
 
 // SQSConn is an endpoint connection
 type SQSConn struct {
@@ -27,7 +23,6 @@ type SQSConn struct {
 	ep      Endpoint
 	session *session.Session
 	svc     *sqs.SQS
-	channel *amqp.Channel
 	ex      bool
 	t       time.Time
 }
@@ -45,12 +40,20 @@ func (conn *SQSConn) Expired() bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	if !conn.ex {
-		if time.Now().Sub(conn.t) > sqsExpiresAfter {
-			conn.ex = true
+		if time.Since(conn.t) > sqsExpiresAfter {
 			conn.close()
+			conn.ex = true
 		}
 	}
 	return conn.ex
+}
+
+// ExpireNow forces the connection to expire
+func (conn *SQSConn) ExpireNow() {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	conn.close()
+	conn.ex = true
 }
 
 func (conn *SQSConn) close() {
@@ -89,7 +92,7 @@ func (conn *SQSConn) Send(msg string) error {
 		sess := session.Must(session.NewSession(&aws.Config{
 			Region:                        &region,
 			Credentials:                   creds,
-			CredentialsChainVerboseErrors: aws.Bool(log.Level >= 3),
+			CredentialsChainVerboseErrors: aws.Bool(log.Level() >= 3),
 			MaxRetries:                    aws.Int(5),
 		}))
 		svc := sqs.New(sess)
@@ -107,10 +110,16 @@ func (conn *SQSConn) Send(msg string) error {
 	}
 
 	queueURL := conn.generateSQSURL()
-	// Send message
+	// Create message
 	sendParams := &sqs.SendMessageInput{
 		MessageBody: aws.String(msg),
 		QueueUrl:    aws.String(queueURL),
+	}
+	if isFifoQueue(queueURL) {
+		key := gjson.Get(msg, "key")
+		id := gjson.Get(msg, "id")
+		keyValue := fmt.Sprintf("%s#%s", key.String(), id.String())
+		sendParams.MessageGroupId = aws.String(keyValue)
 	}
 	_, err := conn.svc.SendMessage(sendParams)
 	if err != nil {
@@ -131,16 +140,20 @@ func newSQSConn(ep Endpoint) *SQSConn {
 func probeSQS(s string) bool {
 	// https://sqs.eu-central-1.amazonaws.com/123456789/myqueue
 	return strings.HasPrefix(s, "https://sqs.") &&
-		strings.Contains(s, ".amazonaws.com/")
+		strings.Contains(s, ".amazonaws.com")
 }
 
 func sqsRegionFromPlainURL(s string) string {
 	parts := strings.Split(s, "https://sqs.")
 	if len(parts) > 1 {
-		parts = strings.Split(parts[1], ".amazonaws.com/")
+		parts = strings.Split(parts[1], ".amazonaws.com")
 		if len(parts) > 1 {
 			return parts[0]
 		}
 	}
 	return ""
+}
+
+func isFifoQueue(s string) bool {
+	return strings.HasSuffix(s, ".fifo")
 }

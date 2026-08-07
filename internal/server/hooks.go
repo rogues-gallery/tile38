@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/buntdb"
@@ -22,23 +23,14 @@ var hookLogSetDefaults = &buntdb.SetOptions{
 	TTL:     time.Second * 30,
 }
 
-type hooksByName []*Hook
-
-func (a hooksByName) Len() int {
-	return len(a)
+func byHookName(a, b interface{}) bool {
+	return a.(*Hook).Name < b.(*Hook).Name
 }
 
-func (a hooksByName) Less(i, j int) bool {
-	return a[i].Name < a[j].Name
-}
-
-func (a hooksByName) Swap(i, j int) {
-	a[i], a[j] = a[j], a[i]
-}
-
-func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
+func (s *Server) cmdSetHook(msg *Message) (
 	res resp.Value, d commandDetails, err error,
 ) {
+	channel := msg.Command() == "setchan"
 	start := time.Now()
 	vs := msg.Args[1:]
 	var name, urls, cmd string
@@ -47,15 +39,14 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 		return NOMessage, d, errInvalidNumberOfArguments
 	}
 	var endpoints []string
-	if chanCmd {
+	if channel {
 		endpoints = []string{"local://" + name}
 	} else {
 		if vs, urls, ok = tokenval(vs); !ok || urls == "" {
 			return NOMessage, d, errInvalidNumberOfArguments
 		}
-		for _, url := range strings.Split(urls, ",") {
-			url = strings.TrimSpace(url)
-			err := c.epc.Validate(url)
+		for _, url := range splitEndpointURLs(urls) {
+			err := s.epc.Validate(url)
 			if err != nil {
 				log.Errorf("sethook: %v", err)
 				return resp.SimpleStringValue(""), d, errInvalidArgument(url)
@@ -65,7 +56,7 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 	}
 	var commandvs []string
 	var cmdlc string
-	var types []string
+	var types map[string]bool
 	var expires float64
 	var expiresSet bool
 	metaMap := make(map[string]string)
@@ -108,21 +99,21 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 		}
 		break
 	}
-	s, err := c.cmdSearchArgs(true, cmdlc, vs, types)
-	defer s.Close()
+	args, err := s.cmdSearchArgs(true, cmdlc, vs, types)
+	if args.usingLua() {
+		defer args.Close()
+	}
 	if err != nil {
 		return NOMessage, d, err
 	}
-	if !s.fence {
+	if !args.fence {
 		return NOMessage, d, errors.New("missing FENCE argument")
 	}
-	s.cmd = cmdlc
+	args.cmd = cmdlc
 	cmsg := &Message{}
 	*cmsg = *msg
 	cmsg.Args = make([]string, len(commandvs))
-	for i := 0; i < len(commandvs); i++ {
-		cmsg.Args[i] = commandvs[i]
-	}
+	copy(cmsg.Args, commandvs)
 	metas := make([]FenceMeta, 0, len(metaMap))
 	for key, val := range metaMap {
 		metas = append(metas, FenceMeta{key, val})
@@ -130,35 +121,36 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 	sort.Sort(hookMetaByName(metas))
 
 	hook := &Hook{
-		Key:       s.key,
+		Key:       args.key,
 		Name:      name,
 		Endpoints: endpoints,
-		Fence:     &s,
+		Fence:     &args,
 		Message:   cmsg,
-		epm:       c.epc,
+		epm:       s.epc,
 		Metas:     metas,
-		channel:   chanCmd,
+		channel:   channel,
 		cond:      sync.NewCond(&sync.Mutex{}),
-		counter:   &c.statsTotalMsgsSent,
+		counter:   &s.statsTotalMsgsSent,
 	}
 	if expiresSet {
 		hook.expires =
 			time.Now().Add(time.Duration(expires * float64(time.Second)))
 	}
-	if !chanCmd {
-		hook.db = c.qdb
+	if !channel {
+		hook.db = s.qdb
 	}
 	var wr bytes.Buffer
-	hook.ScanWriter, err = c.newScanWriter(
-		&wr, cmsg, s.key, s.output, s.precision, s.glob, false,
-		s.cursor, s.limit, s.wheres, s.whereins, s.whereevals, s.nofields)
+	hook.ScanWriter, err = s.newScanWriter(
+		&wr, cmsg, args.key, args.output, args.precision, args.globs, false,
+		args.cursor, args.limit, args.wheres, args.whereins, args.whereevals,
+		args.nofields, args.mvt, args.tileX, args.tileY, args.tileZ)
 	if err != nil {
 
 		return NOMessage, d, err
 	}
-	prevHook := c.hooks[name]
+	prevHook, _ := s.hooks.Get(&Hook{Name: name}).(*Hook)
 	if prevHook != nil {
-		if prevHook.channel != chanCmd {
+		if prevHook.channel != channel {
 			return NOMessage, d,
 				errors.New("hooks and channels cannot share the same name")
 		}
@@ -167,7 +159,7 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 			// for good measure.
 			prevHook.Signal()
 			if !hook.expires.IsZero() {
-				c.hookex.Push(hook)
+				s.hookExpires.Set(hook)
 			}
 			switch msg.OutputType {
 			case JSON:
@@ -177,38 +169,54 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 			}
 		}
 		prevHook.Close()
-		delete(c.hooks, name)
-		delete(c.hooksOut, name)
+		s.hooks.Delete(prevHook)
+		s.hooksOut.Delete(prevHook)
+		if !prevHook.expires.IsZero() {
+			s.hookExpires.Delete(prevHook)
+		}
+		s.groupDisconnectHook(name)
 	}
 
 	d.updated = true
 	d.timestamp = time.Now()
 
-	c.hooks[name] = hook
+	s.hooks.Set(hook)
 	if hook.Fence.detect == nil || hook.Fence.detect["outside"] {
-		c.hooksOut[name] = hook
+		s.hooksOut.Set(hook)
 	}
 
 	// remove previous hook from spatial index
 	if prevHook != nil && prevHook.Fence != nil && prevHook.Fence.obj != nil {
 		rect := prevHook.Fence.obj.Rect()
-		c.hookTree.Delete(
-			[]float64{rect.Min.X, rect.Min.Y},
-			[]float64{rect.Max.X, rect.Max.Y},
+		s.hookTree.Delete(
+			[2]float64{rect.Min.X, rect.Min.Y},
+			[2]float64{rect.Max.X, rect.Max.Y},
 			prevHook)
+		if prevHook.Fence.detect["cross"] {
+			s.hookCross.Delete(
+				[2]float64{rect.Min.X, rect.Min.Y},
+				[2]float64{rect.Max.X, rect.Max.Y},
+				prevHook)
+		}
 	}
 	// add hook to spatial index
 	if hook != nil && hook.Fence != nil && hook.Fence.obj != nil {
 		rect := hook.Fence.obj.Rect()
-		c.hookTree.Insert(
-			[]float64{rect.Min.X, rect.Min.Y},
-			[]float64{rect.Max.X, rect.Max.Y},
+		s.hookTree.Insert(
+			[2]float64{rect.Min.X, rect.Min.Y},
+			[2]float64{rect.Max.X, rect.Max.Y},
 			hook)
+		if hook.Fence.detect["cross"] {
+			s.hookCross.Insert(
+				[2]float64{rect.Min.X, rect.Min.Y},
+				[2]float64{rect.Max.X, rect.Max.Y},
+				hook)
+		}
 	}
 
 	hook.Open() // Opens a goroutine to notify the hook
 	if !hook.expires.IsZero() {
-		c.hookex.Push(hook)
+		s.hookExpires.Set(hook)
 	}
 	switch msg.OutputType {
 	case JSON:
@@ -219,9 +227,53 @@ func (c *Server) cmdSetHook(msg *Message, chanCmd bool) (
 	return NOMessage, d, nil
 }
 
-func (c *Server) cmdDelHook(msg *Message, chanCmd bool) (
+func byHookExpires(a, b interface{}) bool {
+	ha := a.(*Hook)
+	hb := b.(*Hook)
+	if ha.expires.Before(hb.expires) {
+		return true
+	}
+	if ha.expires.After(hb.expires) {
+		return false
+	}
+	return ha.Name < hb.Name
+}
+
+func (s *Server) cmdDELHOOKop(name string, channel bool) (updated bool) {
+	hook, _ := s.hooks.Get(&Hook{Name: name}).(*Hook)
+	if hook == nil || hook.channel != channel {
+		return false
+	}
+	hook.Close()
+	// remove hook from maps
+	s.hooks.Delete(hook)
+	s.hooksOut.Delete(hook)
+	if !hook.expires.IsZero() {
+		s.hookExpires.Delete(hook)
+	}
+	// remove any hook / object connections
+	s.groupDisconnectHook(hook.Name)
+	// remove hook from spatial index
+	if hook.Fence != nil && hook.Fence.obj != nil {
+		rect := hook.Fence.obj.Rect()
+		s.hookTree.Delete(
+			[2]float64{rect.Min.X, rect.Min.Y},
+			[2]float64{rect.Max.X, rect.Max.Y},
+			hook)
+		if hook.Fence.detect["cross"] {
+			s.hookCross.Delete(
+				[2]float64{rect.Min.X, rect.Min.Y},
+				[2]float64{rect.Max.X, rect.Max.Y},
+				hook)
+		}
+	}
+	return true
+}
+
+func (s *Server) cmdDelHook(msg *Message) (
 	res resp.Value, d commandDetails, err error,
 ) {
+	channel := msg.Command() == "delchan"
 	start := time.Now()
 	vs := msg.Args[1:]
 
@@ -233,21 +285,8 @@ func (c *Server) cmdDelHook(msg *Message, chanCmd bool) (
 	if len(vs) != 0 {
 		return NOMessage, d, errInvalidNumberOfArguments
 	}
-	if hook, ok := c.hooks[name]; ok && hook.channel == chanCmd {
-		hook.Close()
-		// remove hook from maps
-		delete(c.hooks, hook.Name)
-		delete(c.hooksOut, hook.Name)
-		// remove hook from spatial index
-		if hook != nil && hook.Fence != nil && hook.Fence.obj != nil {
-			rect := hook.Fence.obj.Rect()
-			c.hookTree.Delete(
-				[]float64{rect.Min.X, rect.Min.Y},
-				[]float64{rect.Max.X, rect.Max.Y},
-				hook)
-		}
-		d.updated = true
-	}
+
+	d.updated = s.cmdDELHOOKop(name, channel)
 	d.timestamp = time.Now()
 
 	switch msg.OutputType {
@@ -262,9 +301,10 @@ func (c *Server) cmdDelHook(msg *Message, chanCmd bool) (
 	return
 }
 
-func (c *Server) cmdPDelHook(msg *Message, channel bool) (
+func (s *Server) cmdPDelHook(msg *Message) (
 	res resp.Value, d commandDetails, err error,
 ) {
+	channel := msg.Command() == "pdelchan"
 	start := time.Now()
 	vs := msg.Args[1:]
 
@@ -278,26 +318,17 @@ func (c *Server) cmdPDelHook(msg *Message, channel bool) (
 	}
 
 	count := 0
-	for name, hook := range c.hooks {
+	var hooks []*Hook
+	s.forEachHookByPattern(pattern, channel, func(hook *Hook) bool {
+		hooks = append(hooks, hook)
+		return true
+	})
+
+	for _, hook := range hooks {
 		if hook.channel != channel {
 			continue
 		}
-		match, _ := glob.Match(pattern, name)
-		if !match {
-			continue
-		}
-		hook.Close()
-		// remove hook from maps
-		delete(c.hooks, hook.Name)
-		delete(c.hooksOut, hook.Name)
-		// remove hook from spatial index
-		if hook != nil && hook.Fence != nil && hook.Fence.obj != nil {
-			rect := hook.Fence.obj.Rect()
-			c.hookTree.Delete(
-				[]float64{rect.Min.X, rect.Min.Y},
-				[]float64{rect.Max.X, rect.Max.Y},
-				hook)
-		}
+		s.cmdDELHOOKop(hook.Name, channel)
 		d.updated = true
 		count++
 	}
@@ -312,38 +343,30 @@ func (c *Server) cmdPDelHook(msg *Message, channel bool) (
 	return
 }
 
-// possiblyExpireHook will evaluate a hook by it's name for expiration and
-// purge it from the database if needed. This operation is called from an
-// independent goroutine
-func (c *Server) possiblyExpireHook(name string) {
-	c.mu.Lock()
-	if h, ok := c.hooks[name]; ok {
-		if !h.expires.IsZero() && time.Now().After(h.expires) {
-			// purge from database
-			msg := &Message{}
-			if h.channel {
-				msg.Args = []string{"delchan", h.Name}
-			} else {
-				msg.Args = []string{"delhook", h.Name}
-			}
-			_, d, err := c.cmdDelHook(msg, h.channel)
-			if err != nil {
-				c.mu.Unlock()
-				panic(err)
-			}
-			if err := c.writeAOF(msg.Args, &d); err != nil {
-				c.mu.Unlock()
-				panic(err)
-			}
-			log.Debugf("purged hook %v", h.Name)
+func (s *Server) forEachHookByPattern(
+	pattern string, channel bool, iter func(hook *Hook) bool,
+) {
+	g := glob.Parse(pattern, false)
+	hasUpperLimit := g.Limits[1] != ""
+	s.hooks.Ascend(&Hook{Name: g.Limits[0]}, func(v interface{}) bool {
+		hook := v.(*Hook)
+		if hasUpperLimit && hook.Name > g.Limits[1] {
+			return false
 		}
-	}
-	c.mu.Unlock()
+		if hook.channel == channel {
+			match, _ := glob.Match(pattern, hook.Name)
+			if match {
+				return iter(hook)
+			}
+		}
+		return true
+	})
 }
 
-func (c *Server) cmdHooks(msg *Message, channel bool) (
+func (s *Server) cmdHooks(msg *Message) (
 	res resp.Value, err error,
 ) {
+	channel := msg.Command() == "chans"
 	start := time.Now()
 	vs := msg.Args[1:]
 
@@ -357,18 +380,6 @@ func (c *Server) cmdHooks(msg *Message, channel bool) (
 		return NOMessage, errInvalidNumberOfArguments
 	}
 
-	var hooks []*Hook
-	for name, hook := range c.hooks {
-		if hook.channel != channel {
-			continue
-		}
-		match, _ := glob.Match(pattern, name)
-		if match {
-			hooks = append(hooks, hook)
-		}
-	}
-	sort.Sort(hooksByName(hooks))
-
 	switch msg.OutputType {
 	case JSON:
 		buf := &bytes.Buffer{}
@@ -378,13 +389,22 @@ func (c *Server) cmdHooks(msg *Message, channel bool) (
 		} else {
 			buf.WriteString(`"hooks":[`)
 		}
-		for i, hook := range hooks {
+		var i int
+		s.forEachHookByPattern(pattern, channel, func(hook *Hook) bool {
+			var ttl = -1
+			if !hook.expires.IsZero() {
+				ttl = int(hook.expires.Sub(start).Seconds())
+				if ttl < 0 {
+					ttl = 0
+				}
+			}
 			if i > 0 {
 				buf.WriteByte(',')
 			}
 			buf.WriteString(`{`)
 			buf.WriteString(`"name":` + jsonString(hook.Name))
 			buf.WriteString(`,"key":` + jsonString(hook.Key))
+			buf.WriteString(`,"ttl":` + strconv.Itoa(ttl))
 			if !channel {
 				buf.WriteString(`,"endpoints":[`)
 				for i, endpoint := range hook.Endpoints {
@@ -393,8 +413,9 @@ func (c *Server) cmdHooks(msg *Message, channel bool) (
 					}
 					buf.WriteString(jsonString(endpoint))
 				}
+				buf.WriteString(`]`)
 			}
-			buf.WriteString(`],"command":[`)
+			buf.WriteString(`,"command":[`)
 			for i, v := range hook.Message.Args {
 				if i > 0 {
 					buf.WriteString(`,`)
@@ -411,13 +432,15 @@ func (c *Server) cmdHooks(msg *Message, channel bool) (
 				buf.WriteString(jsonString(meta.Value))
 			}
 			buf.WriteString(`}}`)
-		}
+			i++
+			return true
+		})
 		buf.WriteString(`],"elapsed":"` +
-			time.Now().Sub(start).String() + "\"}")
+			time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		var vals []resp.Value
-		for _, hook := range hooks {
+		s.forEachHookByPattern(pattern, channel, func(hook *Hook) bool {
 			var hvals []resp.Value
 			hvals = append(hvals, resp.StringValue(hook.Name))
 			hvals = append(hvals, resp.StringValue(hook.Key))
@@ -438,7 +461,8 @@ func (c *Server) cmdHooks(msg *Message, channel bool) (
 			}
 			hvals = append(hvals, resp.ArrayValue(metas))
 			vals = append(vals, resp.ArrayValue(hvals))
-		}
+			return true
+		})
 		return resp.ArrayValue(vals), nil
 	}
 	return resp.SimpleStringValue(""), nil
@@ -461,7 +485,7 @@ type Hook struct {
 	query      string
 	epm        *endpoint.Manager
 	expires    time.Time
-	counter    *aint // counter that grows when a message was sent
+	counter    *atomic.Int64 // counter that grows when a message was sent
 	sig        int
 }
 
@@ -661,7 +685,7 @@ func (h *Hook) proc() (ok bool) {
 			}
 			log.Debugf("Endpoint send ok: %v: %v: %v", idx, endpoint, err)
 			sent = true
-			h.counter.add(1)
+			h.counter.Add(1)
 			break
 		}
 		if !sent {
@@ -691,4 +715,24 @@ func (h *Hook) proc() (ok bool) {
 		}
 	}
 	return true
+}
+
+// splitEndpointURLs splits endpoint URLs on commas, but rejoins parts
+// that don't have a scheme prefix (e.g. kafka broker addresses).
+func splitEndpointURLs(s string) []string {
+	parts := strings.Split(s, ",")
+	var urls []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if len(urls) > 0 && !hasSchemePrefix(part) {
+			urls[len(urls)-1] += "," + part
+		} else {
+			urls = append(urls, part)
+		}
+	}
+	return urls
+}
+
+func hasSchemePrefix(s string) bool {
+	return strings.Contains(s, "://") || strings.HasPrefix(s, "Endpoint=")
 }

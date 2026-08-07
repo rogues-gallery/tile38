@@ -1,14 +1,6 @@
 package endpoint
 
-import (
-	"time"
-)
-
-const (
-	localExpiresAfter = time.Second * 30
-)
-
-// LocalPublisher is used to publish local notifcations
+// LocalPublisher is used to publish local notifications
 type LocalPublisher interface {
 	Publish(channel string, message ...string) int
 }
@@ -29,6 +21,10 @@ func newLocalConn(ep Endpoint, publisher LocalPublisher) *LocalConn {
 // Expired returns true if the connection has expired
 func (conn *LocalConn) Expired() bool {
 	return false
+}
+
+// ExpireNow forces the connection to expire
+func (conn *LocalConn) ExpireNow() {
 }
 
 // Send sends a message

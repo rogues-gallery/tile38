@@ -17,7 +17,8 @@ import (
 	"github.com/tidwall/geojson/geo"
 	"github.com/tidwall/resp"
 	"github.com/tidwall/tile38/internal/log"
-	"github.com/yuin/gopher-lua"
+	"github.com/tidwall/tinylru"
+	lua "github.com/yuin/gopher-lua"
 	luajson "layeh.com/gopher-json"
 )
 
@@ -25,6 +26,9 @@ const (
 	iniLuaPoolSize = 5
 	maxLuaPoolSize = 1000
 )
+
+// For Lua os.clock() impl
+var startedAt = time.Now()
 
 var errShaNotFound = errors.New("sha not found")
 var errCmdNotSupported = errors.New("command not supported in scripts")
@@ -37,16 +41,16 @@ var errTimeout = errors.New("timeout")
 // Go-routine-safe pool of read-to-go lua states
 type lStatePool struct {
 	m     sync.Mutex
-	c     *Server
+	s     *Server
 	saved []*lua.LState
 	total int
 }
 
 // newPool returns a new pool of lua states
-func (c *Server) newPool() *lStatePool {
+func (s *Server) newPool() *lStatePool {
 	pl := &lStatePool{
 		saved: make([]*lua.LState, iniLuaPoolSize),
-		c:     c,
+		s:     s,
 	}
 	// Fill the pool with some ready handlers
 	for i := 0; i < iniLuaPoolSize; i++ {
@@ -85,12 +89,36 @@ func (pl *lStatePool) Prune() {
 		newSaved := make([]*lua.LState, n-dropNum)
 		copy(newSaved, pl.saved[dropNum:])
 		pl.saved = newSaved
+		pl.total -= dropNum
 	}
 	pl.m.Unlock()
 }
 
 func (pl *lStatePool) New() *lua.LState {
-	L := lua.NewState()
+	// Prevent opening all Lua modules
+	L := lua.NewState(lua.Options{SkipOpenLibs: true})
+
+	allowedModules := []struct {
+		moduleName string
+		moduleFn   lua.LGFunction
+	}{
+		{lua.BaseLibName, openBaseSubset},
+		{lua.TabLibName, lua.OpenTable},
+		{lua.MathLibName, lua.OpenMath},
+		{lua.StringLibName, lua.OpenString},
+		{lua.OsLibName, openOsSubset}, // See below for impl, only opens clock/difftime
+	}
+
+	// Open non-vulnerable modules (i.e. NOT io/os)
+	for _, pair := range allowedModules {
+		if err := L.CallByParam(lua.P{
+			Fn:      L.NewFunction(pair.moduleFn),
+			NRet:    0,
+			Protect: true,
+		}, lua.LString(pair.moduleName)); err != nil {
+			panic(err)
+		}
+	}
 
 	getArgs := func(ls *lua.LState) (evalCmd string, args []string) {
 		evalCmd = ls.GetGlobal("EVAL_CMD").String()
@@ -109,7 +137,7 @@ func (pl *lStatePool) New() *lua.LState {
 	call := func(ls *lua.LState) int {
 		evalCmd, args := getArgs(ls)
 		var numRet int
-		if res, err := pl.c.luaTile38Call(evalCmd, args[0], args[1:]...); err != nil {
+		if res, err := pl.s.luaTile38Call(evalCmd, args[0], args[1:]...); err != nil {
 			ls.RaiseError("ERR %s", err.Error())
 			numRet = 0
 		} else {
@@ -120,7 +148,7 @@ func (pl *lStatePool) New() *lua.LState {
 	}
 	pcall := func(ls *lua.LState) int {
 		evalCmd, args := getArgs(ls)
-		if res, err := pl.c.luaTile38Call(evalCmd, args[0], args[1:]...); err != nil {
+		if res, err := pl.s.luaTile38Call(evalCmd, args[0], args[1:]...); err != nil {
 			ls.Push(ConvertToLua(ls, resp.ErrorValue(err)))
 		} else {
 			ls.Push(ConvertToLua(ls, res))
@@ -160,7 +188,7 @@ func (pl *lStatePool) New() *lua.LState {
 		"error_reply":  errorReply,
 		"status_reply": statusReply,
 		"sha1hex":      sha1hex,
-		"distance_to":	distanceTo,
+		"distance_to":  distanceTo,
 	}
 	L.SetGlobal("tile38", L.SetFuncs(L.NewTable(), exports))
 
@@ -197,13 +225,17 @@ func (pl *lStatePool) Shutdown() {
 type lScriptMap struct {
 	m       sync.Mutex
 	scripts map[string]*lua.FunctionProto
+	lru     tinylru.LRUG[string, *lua.FunctionProto]
 }
 
 func (sm *lScriptMap) Get(key string) (script *lua.FunctionProto, ok bool) {
 	sm.m.Lock()
 	script, ok = sm.scripts[key]
+	if !ok {
+		script, ok = sm.lru.Get(key)
+	}
 	sm.m.Unlock()
-	return
+	return script, ok
 }
 
 func (sm *lScriptMap) Put(key string, script *lua.FunctionProto) {
@@ -212,14 +244,21 @@ func (sm *lScriptMap) Put(key string, script *lua.FunctionProto) {
 	sm.m.Unlock()
 }
 
+func (sm *lScriptMap) PutLRU(key string, script *lua.FunctionProto) {
+	sm.m.Lock()
+	sm.lru.Set(key, script)
+	sm.m.Unlock()
+}
+
 func (sm *lScriptMap) Flush() {
 	sm.m.Lock()
 	sm.scripts = make(map[string]*lua.FunctionProto)
+	sm.lru.Clear()
 	sm.m.Unlock()
 }
 
 // NewScriptMap returns a new map with lua scripts
-func (c *Server) newScriptMap() *lScriptMap {
+func (s *Server) newScriptMap() *lScriptMap {
 	return &lScriptMap{
 		scripts: make(map[string]*lua.FunctionProto),
 	}
@@ -369,7 +408,7 @@ func makeSafeErr(err error) error {
 }
 
 // Run eval/evalro/evalna command or it's -sha variant
-func (c *Server) cmdEvalUnified(scriptIsSha bool, msg *Message) (res resp.Value, err error) {
+func (s *Server) cmdEvalUnified(scriptIsSha bool, msg *Message) (res resp.Value, err error) {
 	start := time.Now()
 	vs := msg.Args[1:]
 
@@ -389,7 +428,7 @@ func (c *Server) cmdEvalUnified(scriptIsSha bool, msg *Message) (res resp.Value,
 		return
 	}
 
-	luaState, err := c.luapool.Get()
+	luaState, err := s.luapool.Get()
 	if err != nil {
 		return
 	}
@@ -402,7 +441,7 @@ func (c *Server) cmdEvalUnified(scriptIsSha bool, msg *Message) (res resp.Value,
 		defer luaState.RemoveContext()
 		luaDeadline = lua.LNumber(float64(dlTime.UnixNano()) / 1e9)
 	}
-	defer c.luapool.Put(luaState)
+	defer s.luapool.Put(luaState)
 
 	keysTbl := luaState.CreateTable(int(numkeys), 0)
 	for i = 0; i < numkeys; i++ {
@@ -437,7 +476,7 @@ func (c *Server) cmdEvalUnified(scriptIsSha bool, msg *Message) (res resp.Value,
 			"EVAL_CMD": lua.LString(msg.Command()),
 		})
 
-	compiled, ok := c.luascripts.Get(shaSum)
+	compiled, ok := s.luascripts.Get(shaSum)
 	var fn *lua.LFunction
 	if ok {
 		fn = &lua.LFunction{
@@ -456,7 +495,7 @@ func (c *Server) cmdEvalUnified(scriptIsSha bool, msg *Message) (res resp.Value,
 		if err != nil {
 			return NOMessage, makeSafeErr(err)
 		}
-		c.luascripts.Put(shaSum, fn.Proto)
+		s.luascripts.Put(shaSum, fn.Proto)
 	}
 	luaState.Push(fn)
 	defer luaSetRawGlobals(
@@ -481,7 +520,7 @@ func (c *Server) cmdEvalUnified(scriptIsSha bool, msg *Message) (res resp.Value,
 		var buf bytes.Buffer
 		buf.WriteString(`{"ok":true`)
 		buf.WriteString(`,"result":` + ConvertToJSON(ret))
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		return ConvertToRESP(ret), nil
@@ -489,36 +528,36 @@ func (c *Server) cmdEvalUnified(scriptIsSha bool, msg *Message) (res resp.Value,
 	return NOMessage, nil
 }
 
-func (c *Server) cmdScriptLoad(msg *Message) (resp.Value, error) {
+func (s *Server) cmdScriptLoad(msg *Message) (resp.Value, error) {
 	start := time.Now()
 	vs := msg.Args[1:]
 
 	var ok bool
 	var script string
-	if vs, script, ok = tokenval(vs); !ok || script == "" {
+	if _, script, ok = tokenval(vs); !ok || script == "" {
 		return NOMessage, errInvalidNumberOfArguments
 	}
 
 	shaSum := Sha1Sum(script)
 
-	luaState, err := c.luapool.Get()
+	luaState, err := s.luapool.Get()
 	if err != nil {
 		return NOMessage, err
 	}
-	defer c.luapool.Put(luaState)
+	defer s.luapool.Put(luaState)
 
 	fn, err := luaState.Load(strings.NewReader(script), "f_"+shaSum)
 	if err != nil {
 		return NOMessage, makeSafeErr(err)
 	}
-	c.luascripts.Put(shaSum, fn.Proto)
+	s.luascripts.Put(shaSum, fn.Proto)
 
 	switch msg.OutputType {
 	case JSON:
 		var buf bytes.Buffer
 		buf.WriteString(`{"ok":true`)
 		buf.WriteString(`,"result":"` + shaSum + `"`)
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		return resp.StringValue(shaSum), nil
@@ -526,7 +565,7 @@ func (c *Server) cmdScriptLoad(msg *Message) (resp.Value, error) {
 	return NOMessage, nil
 }
 
-func (c *Server) cmdScriptExists(msg *Message) (resp.Value, error) {
+func (s *Server) cmdScriptExists(msg *Message) (resp.Value, error) {
 	start := time.Now()
 	vs := msg.Args[1:]
 
@@ -538,7 +577,7 @@ func (c *Server) cmdScriptExists(msg *Message) (resp.Value, error) {
 		if vs, shaSum, ok = tokenval(vs); !ok || shaSum == "" {
 			return NOMessage, errInvalidNumberOfArguments
 		}
-		_, ok = c.luascripts.Get(shaSum)
+		_, ok = s.luascripts.Get(shaSum)
 		if ok {
 			ires = 1
 		} else {
@@ -556,7 +595,7 @@ func (c *Server) cmdScriptExists(msg *Message) (resp.Value, error) {
 			resArray = append(resArray, fmt.Sprintf("%d", ires))
 		}
 		buf.WriteString(`,"result":[` + strings.Join(resArray, ",") + `]`)
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		var resArray []resp.Value
@@ -568,15 +607,15 @@ func (c *Server) cmdScriptExists(msg *Message) (resp.Value, error) {
 	return resp.SimpleStringValue(""), nil
 }
 
-func (c *Server) cmdScriptFlush(msg *Message) (resp.Value, error) {
+func (s *Server) cmdScriptFlush(msg *Message) (resp.Value, error) {
 	start := time.Now()
-	c.luascripts.Flush()
+	s.luascripts.Flush()
 
 	switch msg.OutputType {
 	case JSON:
 		var buf bytes.Buffer
 		buf.WriteString(`{"ok":true`)
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		return resp.StringValue("OK"), nil
@@ -584,67 +623,74 @@ func (c *Server) cmdScriptFlush(msg *Message) (resp.Value, error) {
 	return resp.SimpleStringValue(""), nil
 }
 
-func (c *Server) commandInScript(msg *Message) (
+func (s *Server) commandInScript(msg *Message) (
 	res resp.Value, d commandDetails, err error,
 ) {
 	switch msg.Command() {
 	default:
 		err = fmt.Errorf("unknown command '%s'", msg.Args[0])
 	case "set":
-		res, d, err = c.cmdSet(msg)
+		res, d, err = s.cmdSET(msg)
 	case "fset":
-		res, d, err = c.cmdFset(msg)
+		res, d, err = s.cmdFSET(msg)
 	case "del":
-		res, d, err = c.cmdDel(msg)
+		res, d, err = s.cmdDEL(msg)
 	case "pdel":
-		res, d, err = c.cmdPdel(msg)
+		res, d, err = s.cmdPDEL(msg)
 	case "drop":
-		res, d, err = c.cmdDrop(msg)
+		res, d, err = s.cmdDROP(msg)
 	case "expire":
-		res, d, err = c.cmdExpire(msg)
+		res, d, err = s.cmdEXPIRE(msg)
 	case "rename":
-		res, d, err = c.cmdRename(msg, false)
+		res, d, err = s.cmdRENAME(msg)
 	case "renamenx":
-		res, d, err = c.cmdRename(msg, true)
+		res, d, err = s.cmdRENAME(msg)
 	case "persist":
-		res, d, err = c.cmdPersist(msg)
+		res, d, err = s.cmdPERSIST(msg)
 	case "ttl":
-		res, err = c.cmdTTL(msg)
+		res, err = s.cmdTTL(msg)
 	case "stats":
-		res, err = c.cmdStats(msg)
+		res, err = s.cmdSTATS(msg)
 	case "scan":
-		res, err = c.cmdScan(msg)
+		res, err = s.cmdScan(msg)
 	case "nearby":
-		res, err = c.cmdNearby(msg)
+		res, err = s.cmdNearby(msg)
 	case "within":
-		res, err = c.cmdWithin(msg)
+		res, err = s.cmdWITHIN(msg)
 	case "intersects":
-		res, err = c.cmdIntersects(msg)
+		res, err = s.cmdINTERSECTS(msg)
 	case "search":
-		res, err = c.cmdSearch(msg)
+		res, err = s.cmdSearch(msg)
 	case "bounds":
-		res, err = c.cmdBounds(msg)
+		res, err = s.cmdBOUNDS(msg)
 	case "get":
-		res, err = c.cmdGet(msg)
+		res, err = s.cmdGET(msg)
+	case "fget":
+		res, err = s.cmdFGET(msg)
 	case "jget":
-		res, err = c.cmdJget(msg)
+		res, err = s.cmdJget(msg)
 	case "jset":
-		res, d, err = c.cmdJset(msg)
+		res, d, err = s.cmdJset(msg)
 	case "jdel":
-		res, d, err = c.cmdJdel(msg)
+		res, d, err = s.cmdJdel(msg)
 	case "type":
-		res, err = c.cmdType(msg)
+		res, err = s.cmdTYPE(msg)
 	case "keys":
-		res, err = c.cmdKeys(msg)
+		res, err = s.cmdKEYS(msg)
+	case "exists":
+		res, err = s.cmdEXISTS(msg)
+	case "fexists":
+		res, err = s.cmdFEXISTS(msg)
 	case "test":
-		res, err = c.cmdTest(msg)
+		res, err = s.cmdTEST(msg)
 	case "server":
-		res, err = c.cmdServer(msg)
+		res, err = s.cmdSERVER(msg)
 	}
+	s.sendMonitor(err, msg, nil, true)
 	return
 }
 
-func (c *Server) luaTile38Call(evalcmd string, cmd string, args ...string) (resp.Value, error) {
+func (s *Server) luaTile38Call(evalcmd string, cmd string, args ...string) (resp.Value, error) {
 	msg := &Message{}
 	msg.OutputType = RESP
 	msg.Args = append([]string{cmd}, args...)
@@ -667,18 +713,18 @@ func (c *Server) luaTile38Call(evalcmd string, cmd string, args ...string) (resp
 
 	switch evalcmd {
 	case "eval", "evalsha":
-		return c.luaTile38AtomicRW(msg)
+		return s.luaTile38AtomicRW(msg)
 	case "evalro", "evalrosha":
-		return c.luaTile38AtomicRO(msg)
+		return s.luaTile38AtomicRO(msg)
 	case "evalna", "evalnasha":
-		return c.luaTile38NonAtomic(msg)
+		return s.luaTile38NonAtomic(msg)
 	}
 
 	return resp.NullValue(), errCmdNotSupported
 }
 
 // The eval command has already got the lock. No locking on the call from within the script.
-func (c *Server) luaTile38AtomicRW(msg *Message) (resp.Value, error) {
+func (s *Server) luaTile38AtomicRW(msg *Message) (resp.Value, error) {
 	var write bool
 
 	switch msg.Command() {
@@ -688,16 +734,16 @@ func (c *Server) luaTile38AtomicRW(msg *Message) (resp.Value, error) {
 		"rename", "renamenx":
 		// write operations
 		write = true
-		if c.config.followHost() != "" {
+		if s.config.followHost() != "" {
 			return resp.NullValue(), errNotLeader
 		}
-		if c.config.readOnly() {
+		if s.config.readOnly() {
 			return resp.NullValue(), errReadOnly
 		}
 	case "get", "keys", "scan", "nearby", "within", "intersects", "hooks", "search",
-		"ttl", "bounds", "server", "info", "type", "jget", "test":
+		"ttl", "bounds", "server", "info", "type", "jget", "fget", "exists", "fexists", "test":
 		// read operations
-		if c.config.followHost() != "" && !c.fcuponce {
+		if s.config.followHost() != "" && !s.caughtUpOnce() {
 			return resp.NullValue(), errCatchingUp
 		}
 	}
@@ -706,7 +752,7 @@ func (c *Server) luaTile38AtomicRW(msg *Message) (resp.Value, error) {
 		if msg.Deadline != nil {
 			if write {
 				res = NOMessage
-				err  = errTimeoutOnCmd(msg.Command())
+				err = errTimeoutOnCmd(msg.Command())
 				return
 			}
 			defer func() {
@@ -722,14 +768,14 @@ func (c *Server) luaTile38AtomicRW(msg *Message) (resp.Value, error) {
 				}
 			}()
 		}
-		return c.commandInScript(msg)
+		return s.commandInScript(msg)
 	}()
 	if err != nil {
 		return resp.NullValue(), err
 	}
 
 	if write {
-		if err := c.writeAOF(msg.Args, &d); err != nil {
+		if err := s.writeAOF(msg.Args, &d); err != nil {
 			return resp.NullValue(), err
 		}
 	}
@@ -737,7 +783,7 @@ func (c *Server) luaTile38AtomicRW(msg *Message) (resp.Value, error) {
 	return res, nil
 }
 
-func (c *Server) luaTile38AtomicRO(msg *Message) (resp.Value, error) {
+func (s *Server) luaTile38AtomicRO(msg *Message) (resp.Value, error) {
 	switch msg.Command() {
 	default:
 		return resp.NullValue(), errCmdNotSupported
@@ -748,9 +794,9 @@ func (c *Server) luaTile38AtomicRO(msg *Message) (resp.Value, error) {
 		return resp.NullValue(), errReadOnly
 
 	case "get", "keys", "scan", "nearby", "within", "intersects", "hooks", "search",
-		"ttl", "bounds", "server", "info", "type", "jget", "test":
+		"ttl", "bounds", "server", "info", "type", "jget", "fget", "exists", "fexists", "test":
 		// read operations
-		if c.config.followHost() != "" && !c.fcuponce {
+		if s.config.followHost() != "" && !s.caughtUpOnce() {
 			return resp.NullValue(), errCatchingUp
 		}
 	}
@@ -770,7 +816,7 @@ func (c *Server) luaTile38AtomicRO(msg *Message) (resp.Value, error) {
 				}
 			}()
 		}
-		return c.commandInScript(msg)
+		return s.commandInScript(msg)
 	}()
 	if err != nil {
 		return resp.NullValue(), err
@@ -779,7 +825,7 @@ func (c *Server) luaTile38AtomicRO(msg *Message) (resp.Value, error) {
 	return res, nil
 }
 
-func (c *Server) luaTile38NonAtomic(msg *Message) (resp.Value, error) {
+func (s *Server) luaTile38NonAtomic(msg *Message) (resp.Value, error) {
 	var write bool
 
 	// choose the locking strategy
@@ -790,20 +836,20 @@ func (c *Server) luaTile38NonAtomic(msg *Message) (resp.Value, error) {
 		"rename", "renamenx":
 		// write operations
 		write = true
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.config.followHost() != "" {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.config.followHost() != "" {
 			return resp.NullValue(), errNotLeader
 		}
-		if c.config.readOnly() {
+		if s.config.readOnly() {
 			return resp.NullValue(), errReadOnly
 		}
 	case "get", "keys", "scan", "nearby", "within", "intersects", "hooks", "search",
-		"ttl", "bounds", "server", "info", "type", "jget", "test":
+		"ttl", "bounds", "server", "info", "type", "jget", "fget", "exists", "fexists", "test":
 		// read operations
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		if c.config.followHost() != "" && !c.fcuponce {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		if s.config.followHost() != "" && !s.caughtUpOnce() {
 			return resp.NullValue(), errCatchingUp
 		}
 	}
@@ -812,7 +858,7 @@ func (c *Server) luaTile38NonAtomic(msg *Message) (resp.Value, error) {
 		if msg.Deadline != nil {
 			if write {
 				res = NOMessage
-				err  = errTimeoutOnCmd(msg.Command())
+				err = errTimeoutOnCmd(msg.Command())
 				return
 			}
 			defer func() {
@@ -828,17 +874,96 @@ func (c *Server) luaTile38NonAtomic(msg *Message) (resp.Value, error) {
 				}
 			}()
 		}
-		return c.commandInScript(msg)
+		return s.commandInScript(msg)
 	}()
 	if err != nil {
 		return resp.NullValue(), err
 	}
 
 	if write {
-		if err := c.writeAOF(msg.Args, &d); err != nil {
+		if err := s.writeAOF(msg.Args, &d); err != nil {
 			return resp.NullValue(), err
 		}
 	}
 
 	return res, nil
+}
+
+// Opens a subset of the Lua 5.1 base module (tonumber, tostring)
+func openBaseSubset(L *lua.LState) int {
+	basefns := map[string]lua.LGFunction{
+		"tonumber": baseToNumber,
+		"tostring": baseToString,
+	}
+
+	global := L.Get(lua.GlobalsIndex).(*lua.LTable)
+	L.SetGlobal("_G", global)
+	L.SetGlobal("_VERSION", lua.LString(lua.LuaVersion))
+	L.SetGlobal("_GOPHER_LUA_VERSION", lua.LString(lua.PackageName+" "+lua.PackageVersion))
+	basemod := L.RegisterModule("_G", basefns)
+	L.Push(basemod)
+	return 1
+
+}
+
+// Opens a subset of the Lua 5.1 os module (clock, difftime)
+func openOsSubset(L *lua.LState) int {
+	osfns := map[string]lua.LGFunction{
+		"clock":    osClock,
+		"difftime": osDiffTime,
+	}
+	osmod := L.RegisterModule(lua.OsLibName, osfns)
+	L.Push(osmod)
+	return 1
+}
+
+// Lua tonumber()
+func baseToNumber(L *lua.LState) int {
+	base := L.OptInt(2, 10)
+	noBase := L.Get(2) == lua.LNil
+
+	switch lv := L.CheckAny(1).(type) {
+	case lua.LNumber:
+		L.Push(lv)
+	case lua.LString:
+		str := strings.Trim(string(lv), " \n\t")
+		if strings.Contains(str, ".") {
+			if v, err := strconv.ParseFloat(str, lua.LNumberBit); err != nil {
+				L.Push(lua.LNil)
+			} else {
+				L.Push(lua.LNumber(v))
+			}
+		} else {
+			if noBase && strings.HasPrefix(strings.ToLower(str), "0x") {
+				base, str = 16, str[2:] // Hex number
+			}
+			if v, err := strconv.ParseInt(str, base, lua.LNumberBit); err != nil {
+				L.Push(lua.LNil)
+			} else {
+				L.Push(lua.LNumber(v))
+			}
+		}
+	default:
+		L.Push(lua.LNil)
+	}
+	return 1
+}
+
+// Lua tostring()
+func baseToString(L *lua.LState) int {
+	v1 := L.CheckAny(1)
+	L.Push(L.ToStringMeta(v1))
+	return 1
+}
+
+// Lua os.clock()
+func osClock(L *lua.LState) int {
+	L.Push(lua.LNumber(time.Since(startedAt).Seconds()))
+	return 1
+}
+
+// Lua os.difftime()
+func osDiffTime(L *lua.LState) int {
+	L.Push(lua.LNumber(L.CheckInt64(1) - L.CheckInt64(2)))
+	return 1
 }

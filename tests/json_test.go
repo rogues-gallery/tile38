@@ -1,10 +1,10 @@
 package tests
 
-import "testing"
+func subTestJSON(g *testGroup) {
+	g.regSubTest("basic", json_JSET_basic_test)
+	g.regSubTest("geojson", json_JSET_geojson_test)
+	g.regSubTest("number", json_JSET_number_test)
 
-func subTestJSON(t *testing.T, mc *mockServer) {
-	runStep(t, mc, "basic", json_JSET_basic_test)
-	runStep(t, mc, "geojson", json_JSET_geojson_test)
 }
 func json_JSET_basic_test(mc *mockServer) error {
 	return mc.DoBatch([][]interface{}{
@@ -14,11 +14,11 @@ func json_JSET_basic_test(mc *mockServer) error {
 		{"JGET", "mykey", "myid1"}, {`{"hello":"planet"}`},
 		{"JSET", "mykey", "myid1", "user.name.last", "tom"}, {"OK"},
 		{"JSET", "mykey", "myid1", "user.name.first", "andrew"}, {"OK"},
-		{"JGET", "mykey", "myid1"}, {`{"user":{"name":{"first":"andrew","last":"tom"}},"hello":"planet"}`},
+		{"JGET", "mykey", "myid1"}, {`{"hello":"planet","user":{"name":{"last":"tom","first":"andrew"}}}`},
 		{"JDEL", "mykey", "myid1", "user.name.last"}, {1},
-		{"JGET", "mykey", "myid1"}, {`{"user":{"name":{"first":"andrew"}},"hello":"planet"}`},
+		{"JGET", "mykey", "myid1"}, {`{"hello":"planet","user":{"name":{"first":"andrew"}}}`},
 		{"JDEL", "mykey", "myid1", "user.name.last"}, {0},
-		{"JGET", "mykey", "myid1"}, {`{"user":{"name":{"first":"andrew"}},"hello":"planet"}`},
+		{"JGET", "mykey", "myid1"}, {`{"hello":"planet","user":{"name":{"first":"andrew"}}}`},
 		{"JDEL", "mykey2", "myid1", "user.name.last"}, {0},
 	})
 }
@@ -37,5 +37,18 @@ func json_JSET_geojson_test(mc *mockServer) error {
 		{"JSET", "mykey", "myid1", "properties.tags.-1", "hot"}, {"OK"},
 		{"JGET", "mykey", "myid1"}, {`{"type":"Feature","geometry":{"type":"Point","coordinates":[-115,44]},"properties":{"tags":["southwest","united states","hot"]}}`},
 		{"JDEL", "mykey", "myid1", "type"}, {"ERR missing type"},
+	})
+}
+
+func json_JSET_number_test(mc *mockServer) error {
+	return mc.DoBatch([][]interface{}{
+		{"JSET", "mykey", "myid1", "hello", "0"}, {"OK"},
+		{"JGET", "mykey", "myid1"}, {`{"hello":0}`},
+		{"JSET", "mykey", "myid1", "hello", "0123"}, {"OK"},
+		{"JGET", "mykey", "myid1"}, {`{"hello":"0123"}`},
+		{"JSET", "mykey", "myid1", "hello", "3.14"}, {"OK"},
+		{"JGET", "mykey", "myid1"}, {`{"hello":3.14}`},
+		{"JSET", "mykey", "myid1", "hello", "1.0e10"}, {"OK"},
+		{"JGET", "mykey", "myid1"}, {`{"hello":1.0e10}`},
 	})
 }

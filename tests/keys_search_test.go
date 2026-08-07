@@ -1,38 +1,141 @@
 package tests
 
 import (
+	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"sort"
 	"testing"
+	"time"
+
+	"github.com/gomodule/redigo/redis"
+	"github.com/tidwall/gjson"
 )
 
-func subTestSearch(t *testing.T, mc *mockServer) {
-	runStep(t, mc, "KNN", keys_KNN_test)
-	runStep(t, mc, "KNN_CURSOR", keys_KNN_cursor_test)
-	runStep(t, mc, "WITHIN_CIRCLE", keys_WITHIN_CIRCLE_test)
-	runStep(t, mc, "INTERSECTS_CIRCLE", keys_INTERSECTS_CIRCLE_test)
-	runStep(t, mc, "WITHIN", keys_WITHIN_test)
-	runStep(t, mc, "WITHIN_CURSOR", keys_WITHIN_CURSOR_test)
-	runStep(t, mc, "INTERSECTS", keys_INTERSECTS_test)
-	runStep(t, mc, "INTERSECTS_CURSOR", keys_INTERSECTS_CURSOR_test)
-	runStep(t, mc, "SCAN_CURSOR", keys_SCAN_CURSOR_test)
-	runStep(t, mc, "SEARCH_CURSOR", keys_SEARCH_CURSOR_test)
-	runStep(t, mc, "MATCH", keys_MATCH_test)
-	runStep(t, mc, "FIELDS", keys_FIELDS_search_test)
+func subTestSearch(g *testGroup) {
+	g.regSubTest("KNN_BASIC", keys_KNN_basic_test)
+	g.regSubTest("KNN_RANDOM", keys_KNN_random_test)
+	g.regSubTest("KNN_CURSOR", keys_KNN_cursor_test)
+	g.regSubTest("NEARBY_SPARSE", keys_NEARBY_SPARSE_test)
+	g.regSubTest("WITHIN_CIRCLE", keys_WITHIN_CIRCLE_test)
+	g.regSubTest("WITHIN_SECTOR", keys_WITHIN_SECTOR_test)
+	g.regSubTest("INTERSECTS_CIRCLE", keys_INTERSECTS_CIRCLE_test)
+	g.regSubTest("INTERSECTS_SECTOR", keys_INTERSECTS_SECTOR_test)
+	g.regSubTest("WITHIN", keys_WITHIN_test)
+	g.regSubTest("WITHIN_CURSOR", keys_WITHIN_CURSOR_test)
+	g.regSubTest("WITHIN_CLIPBY", keys_WITHIN_CLIPBY_test)
+	g.regSubTest("INTERSECTS", keys_INTERSECTS_test)
+	g.regSubTest("INTERSECTS_CURSOR", keys_INTERSECTS_CURSOR_test)
+	g.regSubTest("INTERSECTS_CLIPBY", keys_INTERSECTS_CLIPBY_test)
+	g.regSubTest("SCAN_CURSOR", keys_SCAN_CURSOR_test)
+	g.regSubTest("SEARCH_CURSOR", keys_SEARCH_CURSOR_test)
+	g.regSubTest("MATCH", keys_MATCH_test)
+	g.regSubTest("FIELDS", keys_FIELDS_search_test)
+	g.regSubTest("BUFFER", keys_BUFFER_search_test)
+	g.regSubTest("A5", keys_A5_test)
 }
 
-func keys_KNN_test(mc *mockServer) error {
+func keys_KNN_basic_test(mc *mockServer) error {
 	return mc.DoBatch([][]interface{}{
 		{"SET", "mykey", "1", "POINT", 5, 5}, {"OK"},
 		{"SET", "mykey", "2", "POINT", 19, 19}, {"OK"},
 		{"SET", "mykey", "3", "POINT", 12, 19}, {"OK"},
 		{"SET", "mykey", "4", "POINT", -5, 5}, {"OK"},
 		{"SET", "mykey", "5", "POINT", 33, 21}, {"OK"},
+		{"SET", "mykey", "6", "POINT", 52, 13}, {"OK"},
 		{"NEARBY", "mykey", "LIMIT", 10, "POINTS", "POINT", 20, 20}, {
-			"[0 [[2 [19 19]] [3 [12 19]] [5 [33 21]] [1 [5 5]] [4 [-5 5]]]]"},
-		{"NEARBY", "mykey", "LIMIT", 10, "IDS", "POINT", 20, 20, 4000000}, {"[0 [2 3 5 1 4]]"},
-		{"NEARBY", "mykey", "LIMIT", 10, "IDS", "POINT", 20, 20, 1500000}, {"[0 [2 3 5]]"},
+			"[0 [[2 [19 19]] [3 [12 19]] [5 [33 21]] [1 [5 5]] [4 [-5 5]] [6 [52 13]]]]"},
+		{"NEARBY", "mykey", "LIMIT", 10, "IDS", "POINT", 20, 20, 4000000}, {"[0 [2 3 5 1 4 6]]"},
+		{"NEARBY", "mykey", "LIMIT", 10, "DISTANCE", "IDS", "POINT", 20, 20, 1500000}, {"[0 [[2 152808.67164037024] [3 895945.1409106688] [5 1448929.5916252395]]]"},
+		{"NEARBY", "mykey", "LIMIT", 10, "DISTANCE", "POINT", 52, 13, 100}, {`[0 [[6 {"type":"Point","coordinates":[13,52]} 0]]]`},
+		{"NEARBY", "mykey", "LIMIT", 10, "POINT", 52.1, 13.1, 100000}, {`[0 [[6 {"type":"Point","coordinates":[13,52]}]]]`},
+		{"OUTPUT", "json"}, {func(res string) bool { return gjson.Get(res, "ok").Bool() }},
+		{"NEARBY", "mykey", "LIMIT", 10, "DISTANCE", "IDS", "POINT", 20, 20, 1500000}, {
+			func(res string) error {
+				if !gjson.Get(res, "ok").Bool() {
+					return errors.New("not ok")
+				}
+				if gjson.Get(res, "ids.#").Int() != 3 {
+					return fmt.Errorf("expected '%d' objects, got '%d'", 3, gjson.Get(res, "ids.#").Int())
+				}
+				if gjson.Get(res, "ids.#.distance|#").Int() != 3 {
+					return fmt.Errorf("expected '%d' distances, got '%d'", 3, gjson.Get(res, "ids.#.distance|#").Int())
+				}
+
+				for i, d := range gjson.Get(res, "ids.#.distance").Array() {
+					if d.Float() <= 0 {
+						return fmt.Errorf("expected all distances to be greater than 0: (%d, %f)", i, d.Float())
+					}
+				}
+
+				return nil
+			},
+		},
+		{"NEARBY", "mykey", "LIMIT", 10, "DISTANCE", "IDS", "POINT", 52, 13, 100}, {
+			func(res string) error {
+				expected := 0.0
+
+				if !gjson.Get(res, "ok").Bool() {
+					return errors.New("not ok")
+				}
+
+				if gjson.Get(res, "ids.0.distance").Float() != expected {
+					return fmt.Errorf("expected '%f' distances, got '%f'", expected, gjson.Get(res, "ids.0.distance").Float())
+				}
+
+				return nil
+			},
+		},
 	})
+}
+
+func keys_KNN_random_test(mc *mockServer) error {
+
+	// do random points
+	mc.Do("OUTPUT", "resp")
+	mc.Do("DROP", "points")
+	defer mc.Do("DROP", "points")
+
+	seed := time.Now().UnixNano()
+	// seed = 98123098
+	rng := rand.New(rand.NewSource(seed))
+	rpoint := func() [2]float64 {
+		return [2]float64{
+			rng.Float64()*360 - 180,
+			rng.Float64()*180 - 90,
+		}
+	}
+	N := 5000
+	points := make([][2]float64, N)
+	for i := 0; i < len(points); i++ {
+		points[i] = rpoint()
+		res, err := redis.String(mc.Do("SET", "points", i, "POINT", points[i][1], points[i][0]))
+		if err != nil {
+			return err
+		}
+		if res != "OK" {
+			return fmt.Errorf("expected 'OK', got '%s'", res)
+		}
+	}
+	target := rpoint()
+
+	mc.Do("OUTPUT", "json")
+	defer mc.Do("OUTPUT", "resp")
+
+	res, err := redis.String(mc.Do("NEARBY", "points", "LIMIT", N, "POINT", target[1], target[0]))
+	if err != nil {
+		return err
+	}
+
+	ldist := math.Inf(-1)
+	for _, dist := range gjson.Get(res, "objects.#.distance").Array() {
+		if ldist > dist.Float() {
+			return fmt.Errorf("out of order")
+		}
+		ldist = dist.Float()
+	}
+	return nil
 }
 
 func keys_KNN_cursor_test(mc *mockServer) error {
@@ -79,7 +182,10 @@ func keys_WITHIN_test(mc *mockServer) error {
 						[-122.44126439094543,37.72906137107]
 					]
 				]
-			}`}, {"[0 [point1 point2 line3 poly4 multipoly5 poly8]]"},
+			}`}, {"[0 [point2 point1 multipoly5 poly8 poly4 line3]]"},
+		{"WITHIN", "mykey", "IDS", "SECTOR", "37.72999", "-122.44760", "1000", "0", "90"}, {
+			"[0 [point2 point1 multipoly5 poly8 poly4 line3]]"},
+		{"WITHIN", "mykey", "IDS", "SECTOR", "37.72999", "-122.44760", "1000", "0", "0"}, {"ERR equal bearings (0 == 0), use CIRCLE instead"},
 
 		{"SET", "key2", "poly9", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.44037926197052,37.73313523548048],[-122.44017541408539,37.73313523548048],[-122.44017541408539,37.73336857568778],[-122.44037926197052,37.73336857568778],[-122.44037926197052,37.73313523548048]]]}`}, {"OK"},
 		{"SET", "key2", "poly10", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.44040071964262,37.73359343010089],[-122.4402666091919,37.73359343010089],[-122.4402666091919,37.73373767596864],[-122.44040071964262,37.73373767596864],[-122.44040071964262,37.73359343010089]]]}`}, {"OK"},
@@ -128,17 +234,69 @@ func keys_WITHIN_CURSOR_test(mc *mockServer) error {
 		{"SET", "mykey", "poly8", "FIELD", "foo", 8, "OBJECT", `{"type":"Polygon","coordinates":[[[-122.4408378,37.7341129],[-122.4408378,37.733],[-122.44,37.733],[-122.44,37.7341129],[-122.4408378,37.7341129]],[[-122.44060993194579,37.73345766902749],[-122.44044363498686,37.73345766902749],[-122.44044363498686,37.73355524732416],[-122.44060993194579,37.73355524732416],[-122.44060993194579,37.73345766902749]],[[-122.44060724973677,37.7336888869566],[-122.4402102828026,37.7336888869566],[-122.4402102828026,37.7339752567853],[-122.44060724973677,37.7339752567853],[-122.44060724973677,37.7336888869566]]]}`}, {"OK"},
 		{"SET", "mykey", "point9", "FIELD", "foo", 9, "POINT", 37.7335, -122.4412}, {"OK"},
 		{"WITHIN", "mykey", "LIMIT", 3, "IDS", "OBJECT", testArea}, {
-			"[3 [point1 point2 line3]]"},
+			"[3 [point2 point9 point1]]"},
 		{"WITHIN", "mykey", "CURSOR", 3, "LIMIT", 3, "IDS", "OBJECT", testArea}, {
-			"[6 [poly4 multipoly5 poly8]]"},
+			"[6 [multipoly5 poly8 poly4]]"},
 		{"WITHIN", "mykey", "WHERE", "foo", 3, 5, "IDS", "OBJECT", testArea}, {
-			"[0 [line3 poly4 multipoly5]]"},
+			"[0 [multipoly5 poly4 line3]]"},
 		{"WITHIN", "mykey", "LIMIT", 1, "WHERE", "foo", 3, 5, "IDS", "OBJECT", testArea}, {
-			"[3 [line3]]"},
+			"[4 [multipoly5]]"},
+		{"WITHIN", "mykey", "CURSOR", 0, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
+			"[2 [point9]]"},
+		{"WITHIN", "mykey", "CURSOR", 1, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
+			"[2 [point9]]"},
+		{"WITHIN", "mykey", "CURSOR", 2, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
+			"[5 [poly8]]"},
 		{"WITHIN", "mykey", "CURSOR", 3, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
-			"[6 [poly8]]"},
-		{"WITHIN", "mykey", "CURSOR", 6, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
-			"[7 [point9]]"},
+			"[5 [poly8]]"},
+		{"WITHIN", "mykey", "CURSOR", 4, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
+			"[5 [poly8]]"},
+		{"WITHIN", "mykey", "CURSOR", 5, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
+			"[0 []]"},
+	})
+}
+
+func keys_WITHIN_CLIPBY_test(mc *mockServer) error {
+	jagged := `{
+		"type":"Polygon",
+		"coordinates":[[
+			[-122.47781753540039,37.74655746554895],
+			[-122.48777389526366,37.7355619376922],
+			[-122.4707794189453,37.73271097867418],
+			[-122.46528625488281,37.735969208590504],
+			[-122.45189666748047,37.73922729512254],
+			[-122.4565315246582,37.75008654795525],
+			[-122.46683120727538,37.75307256315459],
+			[-122.47781753540039,37.74655746554895]
+		]]
+	}`
+
+	return mc.DoBatch([][]interface{}{
+		{"SET", "mykey", "point1", "FIELD", "foo", 1, "POINT", 37.73963454585715, -122.4810791015625}, {"OK"},
+		{"SET", "mykey", "point2", "FIELD", "foo", 2, "POINT", 37.75130811419222, -122.47438430786133}, {"OK"},
+		{"SET", "mykey", "point3", "FIELD", "foo", 1, "POINT", 37.74816932695052, -122.47713088989258}, {"OK"},
+		{"SET", "mykey", "point4", "FIELD", "foo", 2, "POINT", 37.74503040657439, -122.47571468353271}, {"OK"},
+		{"SET", "other", "jagged", "OBJECT", jagged}, {"OK"},
+
+		{"WITHIN", "mykey", "IDS", "GET", "other", "jagged"}, {"[0 [point1 point4]]"},
+		{"WITHIN", "mykey", "IDS", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point3 point4]]"},
+		{"WITHIN", "mykey", "IDS", "GET", "other", "jagged", "CLIPBY", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point4]]"},
+		{"WITHIN", "mykey", "IDS", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+		}, {"[0 [point3 point4 point2]]"},
+		{"WITHIN", "mykey", "IDS", "GET", "other", "jagged", "CLIPBY", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+		}, {"[0 [point4]]"},
+		{"WITHIN", "mykey", "IDS", "GET", "other", "jagged",
+			"CLIPBY", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+			"CLIPBY", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point4]]"},
 	})
 }
 
@@ -164,31 +322,83 @@ func keys_INTERSECTS_test(mc *mockServer) error {
 						[-122.44126439094543,37.732906137107]
 					]
 				]
-			}`}, {"[0 [point1 point2 line3 poly4 multipoly5 poly8]]"},
+			}`}, {"[0 [point2 point1 multipoly5 poly8 poly4 line3]]"},
+		{"INTERSECTS", "mykey", "IDS", "SECTOR", "37.72999", "-122.44760", "1000", "0", "90"}, {
+			"[0 [point2 point1 multipoly5 poly8 poly4 line3]]"},
+		{"INTERSECTS", "mykey", "IDS", "SECTOR", "37.72999", "-122.44760", "1000", "0", "0"}, {"ERR equal bearings (0 == 0), use CIRCLE instead"},
 
 		{"SET", "key2", "poly9", "OBJECT", `{"type": "Polygon","coordinates": [[[-122.44037926197052,37.73313523548048],[-122.44017541408539,37.73313523548048],[-122.44017541408539,37.73336857568778],[-122.44037926197052,37.73336857568778],[-122.44037926197052,37.73313523548048]]]}`}, {"OK"},
 		{"SET", "key2", "poly10", "OBJECT", `{"type": "Polygon","coordinates": [[[-122.44040071964262,37.73359343010089],[-122.4402666091919,37.73359343010089],[-122.4402666091919,37.73373767596864],[-122.44040071964262,37.73373767596864],[-122.44040071964262,37.73359343010089]]]}`}, {"OK"},
 		{"SET", "key2", "poly10.1", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.44051605463028,37.73375464605226],[-122.44028002023695,37.73375464605226],[-122.44028002023695,37.733903134117966],[-122.44051605463028,37.733903134117966],[-122.44051605463028,37.73375464605226]]]}`}, {"OK"},
-		{"INTERSECTS", "key2", "IDS", "GET", "mykey", "poly8"}, {"[0 [poly9 poly10]]"},
+		{"INTERSECTS", "key2", "IDS", "GET", "mykey", "poly8"}, {
+			"[0 [poly10 poly9]]"},
 
 		{"SET", "key3", "poly11", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.44059920310973,37.733279482240874],[-122.4402344226837,37.733279482240874],[-122.4402344226837,37.73375464605226],[-122.44059920310973,37.73375464605226],[-122.44059920310973,37.733279482240874]]]}`}, {"OK"},
 		{"SET", "key3", "poly12", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.44060993194579,37.73238005667773],[-122.44013786315918,37.73238005667773],[-122.44013786315918,37.73316917591997],[-122.44060993194579,37.73316917591997],[-122.44060993194579,37.73238005667773]]]}`}, {"OK"},
 		{"SET", "key3", "poly12.1", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.44074940681458,37.73270249351328],[-122.44008421897887,37.73270249351328],[-122.44008421897887,37.732872196546936],[-122.44074940681458,37.732872196546936],[-122.44074940681458,37.73270249351328]]]}`}, {"OK"},
-		{"INTERSECTS", "key3", "IDS", "GET", "mykey", "multipoly5"}, {"[0 [poly11 poly12]]"},
+		{"INTERSECTS", "key3", "IDS", "GET", "mykey", "multipoly5"}, {
+			"[0 [poly12 poly11]]"},
 
 		{"SET", "key5", "poly13", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.44073867797852,37.733211601447465],[-122.44011640548705,37.733211601447465],[-122.44011640548705,37.7340516218859],[-122.44073867797852,37.7340516218859],[-122.44073867797852,37.733211601447465]],[[-122.44060993194579,37.73345766902749],[-122.44060993194579,37.73355524732416],[-122.44044363498686,37.73355524732416],[-122.44044363498686,37.73345766902749],[-122.44060993194579,37.73345766902749]],[[-122.44060724973677,37.7336888869566],[-122.44060724973677,37.7339752567853],[-122.4402102828026,37.7339752567853],[-122.4402102828026,37.7336888869566],[-122.44060724973677,37.7336888869566]]]}`}, {"OK"},
 		{"SET", "key5", "poly14", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.44154334068298,37.73179457567642],[-122.43935465812682,37.73179457567642],[-122.43935465812682,37.7343740514423],[-122.44154334068298,37.7343740514423],[-122.44154334068298,37.73179457567642]],[[-122.44104981422423,37.73286371140448],[-122.44104981422423,37.73424677678513],[-122.43990182876587,37.73424677678513],[-122.43990182876587,37.73286371140448],[-122.44104981422423,37.73286371140448]],[[-122.44109272956847,37.731870943026074],[-122.43976235389708,37.731870943026074],[-122.43976235389708,37.7326855231885],[-122.44109272956847,37.7326855231885],[-122.44109272956847,37.731870943026074]]]}`}, {"OK"},
-		{"INTERSECTS", "key5", "IDS", "GET", "mykey", "multipoly5"}, {"[0 [poly13]]"},
+		{"INTERSECTS", "key5", "IDS", "GET", "mykey", "multipoly5"}, {
+			"[0 [poly13]]"},
 
 		{"SET", "key6", "multipoly5", "OBJECT", `{"type":"MultiPolygon","coordinates":[[[[-122.4408378,37.7341129],[-122.4408378,37.733],[-122.44,37.733],[-122.44,37.7341129],[-122.4408378,37.7341129]]],[[[-122.44091033935547,37.731981251280985],[-122.43994474411011,37.731981251280985],[-122.43994474411011,37.73254976045042],[-122.44091033935547,37.73254976045042],[-122.44091033935547,37.731981251280985]]]]}`}, {"OK"},
 		{"SET", "key6", "poly13", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.44073867797852,37.733211601447465],[-122.44011640548705,37.733211601447465],[-122.44011640548705,37.7340516218859],[-122.44073867797852,37.7340516218859],[-122.44073867797852,37.733211601447465]],[[-122.44060993194579,37.73345766902749],[-122.44060993194579,37.73355524732416],[-122.44044363498686,37.73355524732416],[-122.44044363498686,37.73345766902749],[-122.44060993194579,37.73345766902749]],[[-122.44060724973677,37.7336888869566],[-122.44060724973677,37.7339752567853],[-122.4402102828026,37.7339752567853],[-122.4402102828026,37.7336888869566],[-122.44060724973677,37.7336888869566]]]}`}, {"OK"},
-		{"INTERSECTS", "key6", "IDS", "GET", "key5", "poly14"}, {"[0 []]"},
+		{"INTERSECTS", "key6", "IDS", "GET", "key5", "poly14"}, {
+			"[0 []]"},
 
 		{"SET", "key7", "multipoly15", "OBJECT", `{"type":"MultiPolygon","coordinates":[[[[-122.44056701660155,37.7332964524295],[-122.44029879570007,37.7332964524295],[-122.44029879570007,37.73375464605226],[-122.44056701660155,37.73375464605226],[-122.44056701660155,37.7332964524295]]],[[[-122.44067430496216,37.73217641163713],[-122.44034171104431,37.73217641163713],[-122.44034171104431,37.732430967850384],[-122.44067430496216,37.732430967850384],[-122.44067430496216,37.73217641163713]]]]}`}, {"OK"},
 		{"SET", "key7", "multipoly16", "OBJECT", `{"type":"MultiPolygon","coordinates":[[[[-122.44056701660155,37.7332964524295],[-122.44029879570007,37.7332964524295],[-122.44029879570007,37.73375464605226],[-122.44056701660155,37.73375464605226],[-122.44056701660155,37.7332964524295]]],[[[-122.4402666091919,37.733109780140644],[-122.4401271343231,37.733109780140644],[-122.4401271343231,37.73323705675229],[-122.4402666091919,37.73323705675229],[-122.4402666091919,37.733109780140644]]]]}`}, {"OK"},
 		{"SET", "key7", "multipoly17", "OBJECT", `{"type":"MultiPolygon","coordinates":[[[[-122.44056701660155,37.7332964524295],[-122.44029879570007,37.7332964524295],[-122.44029879570007,37.73375464605226],[-122.44056701660155,37.73375464605226],[-122.44056701660155,37.7332964524295]]],[[[-122.44032025337218,37.73267703802467],[-122.44013786315918,37.73267703802467],[-122.44013786315918,37.732838255971316],[-122.44032025337218,37.732838255971316],[-122.44032025337218,37.73267703802467]]]]}`}, {"OK"},
 		{"SET", "key7", "multipoly17.1", "OBJECT", `{"type":"MultiPolygon","coordinates":[[[[-122.4407172203064,37.73270249351328],[-122.44049191474916,37.73270249351328],[-122.44049191474916,37.73286371140448],[-122.4407172203064,37.73286371140448],[-122.4407172203064,37.73270249351328]]],[[[-122.44032025337218,37.73267703802467],[-122.44013786315918,37.73267703802467],[-122.44013786315918,37.732838255971316],[-122.44032025337218,37.732838255971316],[-122.44032025337218,37.73267703802467]]]]}`}, {"OK"},
-		{"INTERSECTS", "key7", "IDS", "GET", "mykey", "multipoly5"}, {"[0 [multipoly15 multipoly16 multipoly17]]"},
+		{"INTERSECTS", "key7", "IDS", "GET", "mykey", "multipoly5"}, {
+			"[0 [multipoly15 multipoly17 multipoly16]]"},
+	})
+}
+
+func keys_INTERSECTS_CLIPBY_test(mc *mockServer) error {
+	jagged := `{
+		"type":"Polygon",
+		"coordinates":[[
+			[-122.47781753540039,37.74655746554895],
+			[-122.48777389526366,37.7355619376922],
+			[-122.4707794189453,37.73271097867418],
+			[-122.46528625488281,37.735969208590504],
+			[-122.45189666748047,37.73922729512254],
+			[-122.4565315246582,37.75008654795525],
+			[-122.46683120727538,37.75307256315459],
+			[-122.47781753540039,37.74655746554895]
+		]]
+	}`
+
+	return mc.DoBatch([][]interface{}{
+		{"SET", "mykey", "point1", "FIELD", "foo", 1, "POINT", 37.73963454585715, -122.4810791015625}, {"OK"},
+		{"SET", "mykey", "point2", "FIELD", "foo", 2, "POINT", 37.75130811419222, -122.47438430786133}, {"OK"},
+		{"SET", "mykey", "point3", "FIELD", "foo", 1, "POINT", 37.74816932695052, -122.47713088989258}, {"OK"},
+		{"SET", "mykey", "point4", "FIELD", "foo", 2, "POINT", 37.74503040657439, -122.47571468353271}, {"OK"},
+		{"SET", "other", "jagged", "OBJECT", jagged}, {"OK"},
+
+		{"INTERSECTS", "mykey", "IDS", "GET", "other", "jagged"}, {"[0 [point1 point4]]"},
+		{"INTERSECTS", "mykey", "IDS", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point3 point4]]"},
+		{"INTERSECTS", "mykey", "IDS", "GET", "other", "jagged", "CLIPBY", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point4]]"},
+		{"INTERSECTS", "mykey", "IDS", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+		}, {"[0 [point3 point4 point2]]"},
+		{"INTERSECTS", "mykey", "IDS", "GET", "other", "jagged", "CLIPBY", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+		}, {"[0 [point4]]"},
+		{"INTERSECTS", "mykey", "IDS", "GET", "other", "jagged",
+			"CLIPBY", "BOUNDS",
+			37.74411415606583, -122.48034954071045, 37.7536833241461, -122.47163772583008,
+			"CLIPBY", "BOUNDS",
+			37.737734023260884, -122.47816085815431, 37.74886496155229, -122.45464324951172,
+		}, {"[0 [point4]]"},
 	})
 }
 
@@ -216,17 +426,25 @@ func keys_INTERSECTS_CURSOR_test(mc *mockServer) error {
 		{"SET", "mykey", "poly8", "FIELD", "foo", 8, "OBJECT", `{"type":"Polygon","coordinates":[[[-122.4408378,37.7341129],[-122.4408378,37.733],[-122.44,37.733],[-122.44,37.7341129],[-122.4408378,37.7341129]],[[-122.44060993194579,37.73345766902749],[-122.44044363498686,37.73345766902749],[-122.44044363498686,37.73355524732416],[-122.44060993194579,37.73355524732416],[-122.44060993194579,37.73345766902749]],[[-122.44060724973677,37.7336888869566],[-122.4402102828026,37.7336888869566],[-122.4402102828026,37.7339752567853],[-122.44060724973677,37.7339752567853],[-122.44060724973677,37.7336888869566]]]}`}, {"OK"},
 		{"SET", "mykey", "point9", "FIELD", "foo", 9, "POINT", 37.7335, -122.4412}, {"OK"},
 		{"INTERSECTS", "mykey", "LIMIT", 3, "IDS", "OBJECT", testArea}, {
-			"[3 [point1 point2 line3]]"},
+			"[3 [point2 point9 point1]]"},
 		{"INTERSECTS", "mykey", "CURSOR", 3, "LIMIT", 3, "IDS", "OBJECT", testArea}, {
-			"[6 [poly4 multipoly5 poly8]]"},
+			"[6 [multipoly5 poly8 poly4]]"},
 		{"INTERSECTS", "mykey", "WHERE", "foo", 3, 5, "IDS", "OBJECT", testArea}, {
-			"[0 [line3 poly4 multipoly5]]"},
+			"[0 [multipoly5 poly4 line3]]"},
 		{"INTERSECTS", "mykey", "LIMIT", 1, "WHERE", "foo", 3, 5, "IDS", "OBJECT", testArea}, {
-			"[3 [line3]]"},
+			"[4 [multipoly5]]"},
+		{"INTERSECTS", "mykey", "CURSOR", 1, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
+			"[2 [point9]]"},
+		{"INTERSECTS", "mykey", "CURSOR", 2, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
+			"[5 [poly8]]"},
 		{"INTERSECTS", "mykey", "CURSOR", 3, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
-			"[6 [poly8]]"},
+			"[5 [poly8]]"},
+		{"INTERSECTS", "mykey", "CURSOR", 4, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
+			"[5 [poly8]]"},
+		{"INTERSECTS", "mykey", "CURSOR", 5, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
+			"[0 []]"},
 		{"INTERSECTS", "mykey", "CURSOR", 6, "LIMIT", 1, "WHERE", "foo", 8, 9, "IDS", "OBJECT", testArea}, {
-			"[7 [point9]]"},
+			"[0 []]"},
 	})
 }
 
@@ -240,9 +458,108 @@ func keys_WITHIN_CIRCLE_test(mc *mockServer) error {
 		{"SET", "mykey", "6", "POINT", -5, 5}, {"OK"},
 		{"SET", "mykey", "7", "POINT", 33, 21}, {"OK"},
 		{"WITHIN", "mykey", "IDS", "CIRCLE", 37.7335, -122.4412, 1000}, {
-			"[0 [1 2 3 4 5]]"},
+			"[0 [2 1 5 4 3]]"},
 		{"WITHIN", "mykey", "IDS", "CIRCLE", 37.7335, -122.4412, 10}, {
-			"[0 [1 2]]"},
+			"[0 [2 1]]"},
+	})
+}
+
+func keys_WITHIN_SECTOR_test(mc *mockServer) error {
+	return mc.DoBatch([][]interface{}{
+		{"SET", "mykey", "1", "POINT", 37.7324, -122.4424}, {"OK"},
+		{"SET", "mykey", "2", "POINT", 37.73241, -122.44241}, {"OK"},
+		{"SET", "mykey", "3", "OBJECT", `{"type":"LineString","coordinates":[[-122.4408378,37.7341129],[-122.4408378,37.733]]}`}, {"OK"},
+		{"SET", "mykey", "4", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.4408378,37.7341129],[-122.4408378,37.733],[-122.44,37.733],[-122.44,37.7341129],[-122.4408378,37.7341129]]]}`}, {"OK"},
+		{"SET", "mykey", "5", "OBJECT", `{"type":"MultiPolygon","coordinates":[[[[-122.4408378,37.7341129],[-122.4408378,37.733],[-122.44,37.733],[-122.44,37.7341129],[-122.4408378,37.7341129]]]]}`}, {"OK"},
+		{"SET", "mykey", "6", "POINT", -5, 5}, {"OK"},
+		{"SET", "mykey", "7", "POINT", 33, 21}, {"OK"},
+		{"WITHIN", "mykey", "IDS", "SECTOR", 37.731930, -122.443270, 1000, 0, 90}, {
+			"[0 [2 1 5 4 3]]"},
+		{"WITHIN", "mykey", "IDS", "SECTOR", 37.731930, -122.443270, 100, 0, 90}, {
+			"[0 [2 1]]"},
+	})
+}
+
+func keys_NEARBY_SPARSE_test(mc *mockServer) error {
+	// https://github.com/tidwall/tile38/issues/618
+	return mc.DoBatch([][]interface{}{
+		{"SET", "location", "379", "FIELD", "story", "214", "POINT", "38.343763352486", "-0.48118065817742"}, {"OK"},
+		{"SET", "location", "380", "FIELD", "story", "216", "POINT", "38.343210451684", "-0.48164476701469"}, {"OK"},
+		{"SET", "location", "381", "FIELD", "story", "217", "POINT", "38.343548609904", "-0.4815616494057"}, {"OK"},
+		{"SET", "location", "382", "FIELD", "story", "219", "POINT", "38.342949723291", "-0.48180543529947"}, {"OK"},
+		{"SET", "location", "383", "FIELD", "story", "222", "POINT", "38.343527453662", "-0.48118542576204"}, {"OK"},
+		{"SET", "location", "384", "FIELD", "story", "223", "POINT", "38.342894310235", "-0.48121117150688"}, {"OK"},
+		{"SET", "location", "385", "FIELD", "story", "224", "POINT", "38.343665011791", "-0.48128042649575"}, {"OK"},
+		{"SET", "location", "386", "FIELD", "story", "226", "POINT", "38.34300663218", "-0.48136455958069"}, {"OK"},
+		{"SET", "location", "387", "FIELD", "story", "227", "POINT", "38.343561105586", "-0.48133979329476"}, {"OK"},
+		{"SET", "location", "388", "FIELD", "story", "228", "POINT", "38.343021516797", "-0.48111203609768"}, {"OK"},
+		{"SET", "location", "389", "FIELD", "story", "229", "POINT", "38.34377906915", "-0.48100754592639"}, {"OK"},
+		{"SET", "location", "390", "FIELD", "story", "230", "POINT", "38.343028862949", "-0.48107204744577"}, {"OK"},
+		{"SET", "location", "391", "FIELD", "story", "231", "POINT", "38.342956973955", "-0.48123798785545"}, {"OK"},
+		{"SET", "location", "392", "FIELD", "story", "233", "POINT", "38.343342938888", "-0.48181034196501"}, {"OK"},
+		{"SET", "location", "393", "FIELD", "story", "234", "POINT", "38.343323273543", "-0.48119160635951"}, {"OK"},
+		{"SET", "location", "394", "FIELD", "story", "235", "POINT", "38.343475947604", "-0.48128444286906"}, {"OK"},
+		{"SET", "location", "395", "FIELD", "story", "236", "POINT", "38.343553742872", "-0.48161695699988"}, {"OK"},
+		{"SET", "location", "396", "FIELD", "story", "237", "POINT", "38.343657786414", "-0.48109919689955"}, {"OK"},
+		{"SET", "location", "397", "FIELD", "story", "238", "POINT", "38.342934456291", "-0.48126912781599"}, {"OK"},
+		{"SET", "location", "398", "FIELD", "story", "239", "POINT", "38.343254792078", "-0.48115765613124"}, {"OK"},
+		{"SET", "location", "399", "FIELD", "story", "240", "POINT", "38.342851143141", "-0.48151031587298"}, {"OK"},
+		{"SET", "location", "400", "FIELD", "story", "244", "POINT", "38.343298791244", "-0.48121409612892"}, {"OK"},
+		{"SET", "location", "401", "FIELD", "story", "246", "POINT", "38.343436945653", "-0.48141198331599"}, {"OK"},
+		{"SET", "location", "402", "FIELD", "story", "248", "POINT", "38.343033046491", "-0.48183781756703"}, {"OK"},
+		{"SET", "location", "403", "FIELD", "story", "249", "POINT", "38.343115572723", "-0.48114768365296"}, {"OK"},
+		{"SET", "location", "404", "FIELD", "story", "250", "POINT", "38.343318663597", "-0.48120263102647"}, {"OK"},
+		{"SET", "location", "405", "FIELD", "story", "251", "POINT", "38.343434654108", "-0.4814578363497"}, {"OK"},
+		{"SET", "location", "406", "FIELD", "story", "252", "POINT", "38.343810655958", "-0.48181221112942"}, {"OK"},
+		{"SET", "location", "407", "FIELD", "story", "253", "POINT", "38.342910776509", "-0.48124848403503"}, {"OK"},
+		{"SET", "location", "408", "FIELD", "story", "176", "POINT", "38.343429050328", "-0.48134829622424"}, {"OK"},
+		{"SET", "location", "409", "FIELD", "story", "177", "POINT", "38.343375167926", "-0.4813182716687"}, {"OK"},
+		{"SET", "location", "410", "FIELD", "story", "178", "POINT", "38.343686937911", "-0.48184949541056"}, {"OK"},
+		{"SET", "location", "411", "FIELD", "story", "179", "POINT", "38.343095509246", "-0.48121296750565"}, {"OK"},
+		{"SET", "location", "412", "FIELD", "story", "243", "POINT", "38.343052434763", "-0.48133792363582"}, {"OK"},
+		{"SET", "location", "413", "FIELD", "story", "174", "POINT", "38.343556877562", "-0.4814408412531"}, {"OK"},
+		{"SET", "location", "414", "FIELD", "story", "182", "POINT", "38.34352896108", "-0.48127167080998"}, {"OK"},
+		{"SET", "location", "415", "FIELD", "story", "183", "POINT", "38.343458562741", "-0.48113117383504"}, {"OK"},
+		{"SET", "location", "416", "FIELD", "story", "187", "POINT", "38.343372242633", "-0.48198426529928"}, {"OK"},
+		{"SET", "location", "417", "FIELD", "story", "200", "POINT", "38.343365745635", "-0.48145747589433"}, {"OK"},
+		{"SET", "location", "418", "FIELD", "story", "206", "POINT", "38.343019183653", "-0.48177065402226"}, {"OK"},
+		{"SET", "location", "419", "FIELD", "story", "180", "POINT", "38.343492978961", "-0.48146214309728"}, {"OK"},
+		{"SET", "location", "420", "FIELD", "story", "181", "POINT", "38.343614147661", "-0.48178183237141"}, {"OK"},
+		{"SET", "location", "421", "FIELD", "story", "172", "POINT", "38.34365219519", "-0.48163252690471"}, {"OK"},
+		{"SET", "location", "422", "FIELD", "story", "193", "POINT", "38.343284579937", "-0.48191851957019"}, {"OK"},
+		{"SET", "location", "423", "FIELD", "story", "194", "POINT", "38.342957462369", "-0.48169612941468"}, {"OK"},
+		{"SET", "location", "424", "FIELD", "story", "195", "POINT", "38.343050765851", "-0.48189678247055"}, {"OK"},
+		{"SET", "location", "425", "FIELD", "story", "196", "POINT", "38.343767590125", "-0.48171070193171"}, {"OK"},
+		{"SET", "location", "426", "FIELD", "story", "197", "POINT", "38.343547519997", "-0.4813692941909"}, {"OK"},
+		{"SET", "location", "427", "FIELD", "story", "198", "POINT", "38.342914769086", "-0.48155727196514"}, {"OK"},
+		{"SET", "location", "428", "FIELD", "story", "211", "POINT", "38.342873132946", "-0.48120151934304"}, {"OK"},
+		{"SET", "location", "429", "FIELD", "story", "212", "POINT", "38.343776804477", "-0.48175041955478"}, {"OK"},
+		{"SET", "location", "430", "FIELD", "story", "218", "POINT", "38.343321288826", "-0.48138129717684"}, {"OK"},
+		{"SET", "location", "431", "FIELD", "story", "241", "POINT", "38.34353344767", "-0.4814278700903"}, {"OK"},
+		{"SET", "location", "432", "FIELD", "story", "247", "POINT", "38.34366410657", "-0.48163485684748"}, {"OK"},
+		{"SET", "location", "433", "FIELD", "story", "203", "POINT", "38.343237196083", "-0.48114844901293"}, {"OK"},
+		{"SET", "location", "434", "FIELD", "story", "204", "POINT", "38.342949966718", "-0.48104381934163"}, {"OK"},
+		{"SET", "location", "435", "FIELD", "story", "205", "POINT", "38.343334803169", "-0.48143352609798"}, {"OK"},
+		{"SET", "location", "436", "FIELD", "story", "215", "POINT", "38.343231760033", "-0.48177962151034"}, {"OK"},
+		{"SET", "location", "437", "FIELD", "story", "220", "POINT", "38.34381041238", "-0.48184807353803"}, {"OK"},
+		{"SET", "location", "438", "FIELD", "story", "232", "POINT", "38.3437321952", "-0.4810338033529"}, {"OK"},
+		{"SET", "location", "439", "FIELD", "story", "221", "POINT", "38.343038197665", "-0.48194660158614"}, {"OK"},
+		{"OUTPUT", "json"}, {func(res string) bool { return gjson.Get(res, "ok").Bool() }},
+		{"NEARBY", "location", "SPARSE", "1", "DISTANCE", "POINT", "38.342940855731506", "-0.48126081948077476", "25"}, {
+			// should return 4 objects that include a "distance" field
+			func(res string) error {
+				if !gjson.Get(res, "ok").Bool() {
+					return errors.New("not ok")
+				}
+				if gjson.Get(res, "objects.#").Int() != 4 {
+					return fmt.Errorf("expected '%d' objects, got '%d'", 4, gjson.Get(res, "objects.#").Int())
+				}
+				if gjson.Get(res, "objects.#.distance|#").Int() != 4 {
+					return fmt.Errorf("expected '%d' distances, got '%d'", 4, gjson.Get(res, "objects.#.distance|#").Int())
+				}
+				return nil
+			},
+		},
 	})
 }
 
@@ -256,9 +573,25 @@ func keys_INTERSECTS_CIRCLE_test(mc *mockServer) error {
 		{"SET", "mykey", "6", "POINT", -5, 5}, {"OK"},
 		{"SET", "mykey", "7", "POINT", 33, 21}, {"OK"},
 		{"INTERSECTS", "mykey", "IDS", "CIRCLE", 37.7335, -122.4412, 70}, {
-			"[0 [1 2 3 4 5]]"},
+			"[0 [2 1 5 4 3]]"},
 		{"INTERSECTS", "mykey", "IDS", "CIRCLE", 37.7335, -122.4412, 10}, {
-			"[0 [1 2]]"},
+			"[0 [2 1]]"},
+	})
+}
+
+func keys_INTERSECTS_SECTOR_test(mc *mockServer) error {
+	return mc.DoBatch([][]interface{}{
+		{"SET", "mykey", "1", "POINT", 37.7324, -122.4424}, {"OK"},
+		{"SET", "mykey", "2", "POINT", 37.73241, -122.44241}, {"OK"},
+		{"SET", "mykey", "3", "OBJECT", `{"type":"LineString","coordinates":[[-122.4408378,37.7341129],[-122.4408378,37.733]]}`}, {"OK"},
+		{"SET", "mykey", "4", "OBJECT", `{"type":"Polygon","coordinates":[[[-122.4408378,37.7341129],[-122.4408378,37.733],[-122.44,37.733],[-122.44,37.7341129],[-122.4408378,37.7341129]]]}`}, {"OK"},
+		{"SET", "mykey", "5", "OBJECT", `{"type":"MultiPolygon","coordinates":[[[[-122.4408378,37.7341129],[-122.4408378,37.733],[-122.44,37.733],[-122.44,37.7341129],[-122.4408378,37.7341129]]]]}`}, {"OK"},
+		{"SET", "mykey", "6", "POINT", -5, 5}, {"OK"},
+		{"SET", "mykey", "7", "POINT", 33, 21}, {"OK"},
+		{"INTERSECTS", "mykey", "IDS", "SECTOR", 37.731930, -122.443270, 1000, 0, 90}, {
+			"[0 [2 1 5 4 3]]"},
+		{"INTERSECTS", "mykey", "IDS", "SECTOR", 37.731930, -122.443270, 100, 0, 90}, {
+			"[0 [2 1]]"},
 	})
 }
 
@@ -313,23 +646,28 @@ func keys_MATCH_test(mc *mockServer) error {
 		{"SET", "fleet", "truck2", "POINT", "33.0002", "-112.0002"}, {"OK"},
 		{"SET", "fleet", "luck1", "POINT", "33.0003", "-112.0003"}, {"OK"},
 		{"SET", "fleet", "luck2", "POINT", "33.0004", "-112.0004"}, {"OK"},
+		{"SET", "fleet", "train1", "POINT", "33.0005", "-112.0005"}, {"OK"},
 
-		{"SCAN", "fleet", "IDS"}, {"[0 [luck1 luck2 truck1 truck2]]"},
-		{"SCAN", "fleet", "MATCH", "*", "IDS"}, {"[0 [luck1 luck2 truck1 truck2]]"},
+		{"SCAN", "fleet", "IDS"}, {"[0 [luck1 luck2 train1 truck1 truck2]]"},
+		{"SCAN", "fleet", "MATCH", "*", "IDS"}, {"[0 [luck1 luck2 train1 truck1 truck2]]"},
 		{"SCAN", "fleet", "MATCH", "truck*", "IDS"}, {"[0 [truck1 truck2]]"},
 		{"SCAN", "fleet", "MATCH", "luck*", "IDS"}, {"[0 [luck1 luck2]]"},
 		{"SCAN", "fleet", "MATCH", "*2", "IDS"}, {"[0 [luck2 truck2]]"},
 		{"SCAN", "fleet", "MATCH", "*2*", "IDS"}, {"[0 [luck2 truck2]]"},
 		{"SCAN", "fleet", "MATCH", "*u*", "IDS"}, {"[0 [luck1 luck2 truck1 truck2]]"},
+		{"SCAN", "fleet", "MATCH", "*u*", "MATCH", "*u*", "IDS"}, {"[0 [luck1 luck2 truck1 truck2]]"},
+		{"SCAN", "fleet", "MATCH", "*u*", "MATCH", "*a*", "IDS"}, {"[0 [luck1 luck2 train1 truck1 truck2]]"},
+		{"SCAN", "fleet", "MATCH", "train*", "MATCH", "truck*", "IDS"}, {"[0 [train1 truck1 truck2]]"},
+		{"SCAN", "fleet", "MATCH", "train*", "MATCH", "truck*", "MATCH", "luck1", "IDS"}, {"[0 [luck1 train1 truck1 truck2]]"},
 
 		{"NEARBY", "fleet", "IDS", "POINT", 33.00005, -112.00005, 100000}, {
-			match("[0 [luck1 luck2 truck1 truck2]]"),
+			match("[0 [luck1 luck2 train1 truck1 truck2]]"),
 		},
 		{"NEARBY", "fleet", "MATCH", "*", "IDS", "POINT", 33.00005, -112.00005, 100000}, {
-			match("[0 [luck1 luck2 truck1 truck2]]"),
+			match("[0 [luck1 luck2 train1 truck1 truck2]]"),
 		},
 		{"NEARBY", "fleet", "MATCH", "t*", "IDS", "POINT", 33.00005, -112.00005, 100000}, {
-			match("[0 [truck1 truck2]]"),
+			match("[0 [train1 truck1 truck2]]"),
 		},
 		{"NEARBY", "fleet", "MATCH", "t*2", "IDS", "POINT", 33.00005, -112.00005, 100000}, {
 			match("[0 [truck2]]"),
@@ -339,13 +677,13 @@ func keys_MATCH_test(mc *mockServer) error {
 		},
 
 		{"INTERSECTS", "fleet", "IDS", "BOUNDS", 33, -113, 34, -112}, {
-			match("[0 [luck1 luck2 truck1 truck2]]"),
+			match("[0 [luck1 luck2 train1 truck1 truck2]]"),
 		},
 		{"INTERSECTS", "fleet", "MATCH", "*", "IDS", "BOUNDS", 33, -113, 34, -112}, {
-			match("[0 [luck1 luck2 truck1 truck2]]"),
+			match("[0 [luck1 luck2 train1 truck1 truck2]]"),
 		},
 		{"INTERSECTS", "fleet", "MATCH", "t*", "IDS", "BOUNDS", 33, -113, 34, -112}, {
-			match("[0 [truck1 truck2]]"),
+			match("[0 [train1 truck1 truck2]]"),
 		},
 		{"INTERSECTS", "fleet", "MATCH", "t*2", "IDS", "BOUNDS", 33, -113, 34, -112}, {
 			match("[0 [truck2]]"),
@@ -372,7 +710,8 @@ func keys_FIELDS_search_test(mc *mockServer) error {
 				`[1 {"type":"Point","coordinates":[-112.2791,33.522]} [field1 10 field2 11]] ` +
 				`[3 {"type":"Point","coordinates":[-112.2795,33.5224]} [field1 30 field2 13]] ` +
 				`[4 {"type":"Point","coordinates":[-112.2797,33.5226]} [field1 40 field2 14]] ` +
-				`[5 {"type":"Point","coordinates":[-112.2799,33.5228]} [field2 15 field3 28]]]]`},
+				`[5 {"type":"Point","coordinates":[-112.2799,33.5228]} [field2 15 field3 28]]]]`,
+		},
 		{"NEARBY", "mykey", "WHERE", "field2", 0, 2, "POINT", 33.462, -112.268, 60000}, {
 			`[0 [` +
 				`[6 {"type":"Point","coordinates":[-112.2801,33.523]} [field3 29]] ` +
@@ -380,14 +719,15 @@ func keys_FIELDS_search_test(mc *mockServer) error {
 
 		{"WITHIN", "mykey", "WHERE", "field2", 11, "+inf", "CIRCLE", 33.462, -112.268, 60000}, {
 			`[0 [` +
-				`[1 {"type":"Point","coordinates":[-112.2791,33.522]} [field1 10 field2 11]] ` +
-				`[3 {"type":"Point","coordinates":[-112.2795,33.5224]} [field1 30 field2 13]] ` +
+				`[5 {"type":"Point","coordinates":[-112.2799,33.5228]} [field2 15 field3 28]] ` +
 				`[4 {"type":"Point","coordinates":[-112.2797,33.5226]} [field1 40 field2 14]] ` +
-				`[5 {"type":"Point","coordinates":[-112.2799,33.5228]} [field2 15 field3 28]]]]`},
+				`[3 {"type":"Point","coordinates":[-112.2795,33.5224]} [field1 30 field2 13]] ` +
+				`[1 {"type":"Point","coordinates":[-112.2791,33.522]} [field1 10 field2 11]]]]`,
+		},
 		{"WITHIN", "mykey", "WHERE", "field2", 0, 2, "CIRCLE", 33.462, -112.268, 60000}, {
 			`[0 [` +
-				`[6 {"type":"Point","coordinates":[-112.2801,33.523]} [field3 29]] ` +
-				`[7 {"type":"Point","coordinates":[-112.2803,33.5232]}]]]`},
+				`[7 {"type":"Point","coordinates":[-112.2803,33.5232]}] ` +
+				`[6 {"type":"Point","coordinates":[-112.2801,33.523]} [field3 29]]]]`},
 
 		// test JSON output
 		{"OUTPUT", "json"}, {`{"ok":true}`},
@@ -399,23 +739,54 @@ func keys_FIELDS_search_test(mc *mockServer) error {
 				`{"id":"5","object":{"type":"Point","coordinates":[-112.2799,33.5228]},"fields":[0,15,28]}` +
 				`],"count":4,"cursor":0}`},
 		{"NEARBY", "mykey", "WHERE", "field2", 0, 2, "POINT", 33.462, -112.268, 60000}, {
-			`{"ok":true,"fields":["field1","field2","field3"],"objects":[` +
-				`{"id":"6","object":{"type":"Point","coordinates":[-112.2801,33.523]},"fields":[0,0,29]},` +
-				`{"id":"7","object":{"type":"Point","coordinates":[-112.2803,33.5232]},"fields":[0,0,0]}` +
+			`{"ok":true,"fields":["field3"],"objects":[` +
+				`{"id":"6","object":{"type":"Point","coordinates":[-112.2801,33.523]},"fields":[29]},` +
+				`{"id":"7","object":{"type":"Point","coordinates":[-112.2803,33.5232]},"fields":[0]}` +
 				`],"count":2,"cursor":0}`},
 
 		{"WITHIN", "mykey", "WHERE", "field2", 11, "+inf", "CIRCLE", 33.462, -112.268, 60000}, {
 			`{"ok":true,"fields":["field1","field2","field3"],"objects":[` +
-				`{"id":"1","object":{"type":"Point","coordinates":[-112.2791,33.522]},"fields":[10,11,0]},` +
-				`{"id":"3","object":{"type":"Point","coordinates":[-112.2795,33.5224]},"fields":[30,13,0]},` +
+				`{"id":"5","object":{"type":"Point","coordinates":[-112.2799,33.5228]},"fields":[0,15,28]},` +
 				`{"id":"4","object":{"type":"Point","coordinates":[-112.2797,33.5226]},"fields":[40,14,0]},` +
-				`{"id":"5","object":{"type":"Point","coordinates":[-112.2799,33.5228]},"fields":[0,15,28]}` +
+				`{"id":"3","object":{"type":"Point","coordinates":[-112.2795,33.5224]},"fields":[30,13,0]},` +
+				`{"id":"1","object":{"type":"Point","coordinates":[-112.2791,33.522]},"fields":[10,11,0]}` +
 				`],"count":4,"cursor":0}`},
 		{"WITHIN", "mykey", "WHERE", "field2", 0, 2, "CIRCLE", 33.462, -112.268, 60000}, {
-			`{"ok":true,"fields":["field1","field2","field3"],"objects":[` +
-				`{"id":"6","object":{"type":"Point","coordinates":[-112.2801,33.523]},"fields":[0,0,29]},` +
-				`{"id":"7","object":{"type":"Point","coordinates":[-112.2803,33.5232]},"fields":[0,0,0]}` +
+			`{"ok":true,"fields":["field3"],"objects":[` +
+				`{"id":"7","object":{"type":"Point","coordinates":[-112.2803,33.5232]},"fields":[0]},` +
+				`{"id":"6","object":{"type":"Point","coordinates":[-112.2801,33.523]},"fields":[29]}` +
 				`],"count":2,"cursor":0}`},
+	})
+}
+
+func keys_BUFFER_search_test(mc *mockServer) error {
+	const lineString = `{"type":"LineString","coordinates":[
+		[-116.40289306640624,34.125447565116126],
+		[-116.36444091796875,34.14818102254435],
+		[-116.0980224609375,34.15045403191448],
+		[-115.74920654296874,34.127721186043985],
+		[-115.54870605468749,34.075412438417395],
+		[-115.5267333984375,34.11407854333859],
+		[-115.21911621093749,34.048108084909835],
+		[-115.25207519531249,33.8339199536547],
+		[-115.40588378906249,33.71748624018193]
+	]}`
+
+	return mc.DoBatch([][]interface{}{
+		// points in
+		{"SET", "fleet", "truck01", "POINT", "34.10825132729329", "-115.6436347961428"}, {"OK"},
+		{"SET", "fleet", "truck02", "POINT", "34.07199987534163", "-115.5435562133782"}, {"OK"},
+		{"SET", "fleet", "truck03", "POINT", "34.05123715497616", "-115.2148246765137"}, {"OK"},
+		{"SET", "fleet", "truck04", "POINT", "33.71520164474084", "-115.4110336303711"}, {"OK"},
+		{"SET", "fleet", "truck05", "POINT", "34.12345809664606", "-116.4070129394531"}, {"OK"},
+		// points out
+		{"SET", "fleet", "truck06", "POINT", "35.10825132729329", "-115.6436347961428"}, {"OK"},
+		{"SET", "fleet", "truck07", "POINT", "35.07199987534163", "-115.5435562133782"}, {"OK"},
+		{"SET", "fleet", "truck08", "POINT", "35.05123715497616", "-115.2148246765137"}, {"OK"},
+		{"SET", "fleet", "truck09", "POINT", "35.71520164474084", "-115.4110336303711"}, {"OK"},
+		{"SET", "fleet", "truck10", "POINT", "35.12345809664606", "-116.4070129394531"}, {"OK"},
+		// buffered intersects
+		{"INTERSECTS", "fleet", "BUFFER", "1000", "COUNT", "OBJECT", lineString}, {"5"},
 	})
 }
 
@@ -428,4 +799,20 @@ func match(expectIn string) func(org, v interface{}) (resp, expect interface{}) 
 		})
 		return fmt.Sprintf("%v", org), expectIn
 	}
+}
+
+func subBenchSearch(b *testing.B, mc *mockServer) {
+	runBenchStep(b, mc, "KNN", keys_KNN_bench)
+}
+
+func keys_KNN_bench(mc *mockServer) error {
+	lat := rand.Float64()*180 - 90
+	lon := rand.Float64()*360 - 180
+	_, err := mc.conn.Do("NEARBY",
+		"mykey",
+		"LIMIT", 50,
+		"DISTANCE",
+		"POINTS",
+		"POINT", lat, lon)
+	return err
 }

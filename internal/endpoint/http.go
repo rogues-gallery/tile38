@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"time"
 )
@@ -39,6 +38,10 @@ func (conn *HTTPConn) Expired() bool {
 	return false
 }
 
+// ExpireNow forces the connection to expire
+func (conn *HTTPConn) ExpireNow() {
+}
+
 // Send sends a message
 func (conn *HTTPConn) Send(msg string) error {
 	req, err := http.NewRequest("POST", conn.ep.Original, bytes.NewBufferString(msg))
@@ -54,7 +57,7 @@ func (conn *HTTPConn) Send(msg string) error {
 	// close the connection to reuse it
 	defer resp.Body.Close()
 	// discard response
-	if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 		return err
 	}
 	// Only allow responses with status code 200, 201, and 202

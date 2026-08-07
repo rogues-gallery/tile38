@@ -165,7 +165,7 @@ var Commands = func() map[string]Command {
 }()
 
 var commandsJSON = `{
-  "SET":{
+  "SET": {
     "summary": "Sets the value of an id",
     "complexity": "O(1)",
     "arguments": [
@@ -201,14 +201,14 @@ var commandsJSON = `{
           {
             "name": "XX"
           }
-		]
+        ]
       },
-	  {
-		"name": "value",
+      {
+        "name": "value",
         "enumargs": [
           {
             "name": "OBJECT",
-            "arguments":[
+            "arguments": [
               {
                 "name": "geojson",
                 "type": "geojson"
@@ -217,7 +217,7 @@ var commandsJSON = `{
           },
           {
             "name": "POINT",
-            "arguments":[
+            "arguments": [
               {
                 "name": "lat",
                 "type": "double"
@@ -235,7 +235,7 @@ var commandsJSON = `{
           },
           {
             "name": "BOUNDS",
-            "arguments":[
+            "arguments": [
               {
                 "name": "minlat",
                 "type": "double"
@@ -256,7 +256,7 @@ var commandsJSON = `{
           },
           {
             "name": "HASH",
-            "arguments":[
+            "arguments": [
               {
                 "name": "geohash",
                 "type": "geohash"
@@ -265,7 +265,7 @@ var commandsJSON = `{
           },
           {
             "name": "STRING",
-            "arguments":[
+            "arguments": [
               {
                 "name": "value",
                 "type": "string"
@@ -281,7 +281,7 @@ var commandsJSON = `{
   "EXPIRE": {
     "summary": "Set a timeout on an id",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -301,7 +301,7 @@ var commandsJSON = `{
   "TTL": {
     "summary": "Get a timeout on an id",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -314,10 +314,46 @@ var commandsJSON = `{
     "since": "1.0.0",
     "group": "keys"
   },
+  "EXISTS": {
+    "summary": "Checks to see if a id exists",
+    "complexity": "O(1)",
+    "arguments": [
+      {
+        "name": "key",
+        "type": "string"
+      },
+      {
+        "name": "id",
+        "type": "string"
+      }
+    ],
+    "since": "1.33.0",
+    "group": "keys"
+  },
+  "FEXISTS": {
+    "summary": "Checks to see if a field exists on a id",
+    "complexity": "O(1)",
+    "arguments": [
+      {
+        "name": "key",
+        "type": "string"
+      },
+      {
+        "name": "id",
+        "type": "string"
+      },
+      {
+        "name": "field",
+        "type": "string"
+      }
+    ],
+    "since": "1.33.0",
+    "group": "keys"
+  },
   "PERSIST": {
     "summary": "Remove the existing timeout on an id",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -333,7 +369,7 @@ var commandsJSON = `{
   "FSET": {
     "summary": "Set the value for one or more fields of an id",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -349,12 +385,12 @@ var commandsJSON = `{
         "optional": true
       },
       {
-        "name": ["field","value"],
-        "type": ["string","double"]
+        "name": ["field", "value"],
+        "type": ["string", "double"]
       },
       {
-        "name": ["field","value"],
-        "type": ["string","double"],
+        "name": ["field", "value"],
+        "type": ["string", "double"],
         "multiple": true,
         "optional": true
       }
@@ -362,10 +398,30 @@ var commandsJSON = `{
     "since": "1.0.0",
     "group": "keys"
   },
+  "FGET": {
+    "summary": "Gets the value for the field of an id",
+    "complexity": "O(1)",
+    "arguments": [
+      {
+        "name": "key",
+        "type": "string"
+      },
+      {
+        "name": "id",
+        "type": "string"
+      },
+      {
+        "name": "field",
+        "type": "string"
+      }
+    ],
+    "since": "1.33.0",
+    "group": "keys"
+  },
   "BOUNDS": {
     "summary": "Get the combined bounds of all the objects in a key",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -377,7 +433,7 @@ var commandsJSON = `{
   "GET": {
     "summary": "Get the object of an id",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -423,7 +479,7 @@ var commandsJSON = `{
   "DEL": {
     "summary": "Delete an id from a key",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -431,6 +487,12 @@ var commandsJSON = `{
       {
         "name": "id",
         "type": "string"
+      },
+      {
+        "command": "ERRON404",
+        "name": [],
+        "type": [],
+        "optional": true
       }
     ],
     "since": "1.0.0",
@@ -439,7 +501,7 @@ var commandsJSON = `{
   "DROP": {
     "summary": "Remove a key from the database",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -483,7 +545,7 @@ var commandsJSON = `{
   "KEYS": {
     "summary": "Finds all keys matching the given pattern",
     "complexity": "O(N) where N is the number of keys in the database",
-    "arguments":[
+    "arguments": [
       {
         "name": "pattern",
         "type": "pattern"
@@ -495,7 +557,7 @@ var commandsJSON = `{
   "STATS": {
     "summary": "Show stats for one or more keys",
     "complexity": "O(N) where N is the number of keys being requested",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string",
@@ -508,7 +570,7 @@ var commandsJSON = `{
   "SEARCH": {
     "summary": "Search for string values in a key",
     "complexity": "O(N) where N is the number of values in the key",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -541,35 +603,35 @@ var commandsJSON = `{
           {
             "name": "DESC"
           }
-		]
-	  },
+        ]
+      },
       {
         "command": "WHERE",
-        "name": ["field","min","max"],
-        "type": ["string","double","double"],
+        "name": ["field", "min", "max"],
+        "type": ["string", "double", "double"],
         "optional": true,
         "multiple": true
       },
       {
         "command": "WHEREIN",
-        "name": ["field","count","value"],
-        "type": ["string","integer","double"],
+        "name": ["field", "count", "value"],
+        "type": ["string", "integer", "double"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVAL",
-        "name": ["script","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["script", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVALSHA",
-        "name": ["sha1","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["sha1", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
@@ -599,7 +661,7 @@ var commandsJSON = `{
   "SCAN": {
     "summary": "Incrementally iterate though a key",
     "complexity": "O(N) where N is the number of ids in the key",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -632,35 +694,35 @@ var commandsJSON = `{
           {
             "name": "DESC"
           }
-		]
-	  },
+        ]
+      },
       {
         "command": "WHERE",
-        "name": ["field","min","max"],
-        "type": ["string","double","double"],
+        "name": ["field", "min", "max"],
+        "type": ["string", "double", "double"],
         "optional": true,
         "multiple": true
       },
       {
         "command": "WHEREIN",
-        "name": ["field","count","value"],
-        "type": ["string","integer","double"],
+        "name": ["field", "count", "value"],
+        "type": ["string", "integer", "double"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVAL",
-        "name": ["script","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["script", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVALSHA",
-        "name": ["sha1","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["sha1", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
@@ -708,7 +770,7 @@ var commandsJSON = `{
   "NEARBY": {
     "summary": "Searches for ids that are nearby a point",
     "complexity": "O(log(N)) where N is the number of ids in the area",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -726,12 +788,6 @@ var commandsJSON = `{
         "optional": true
       },
       {
-        "command": "SPARSE",
-        "name": "spread",
-        "type": "integer",
-        "optional": true
-      },
-      {
         "command": "MATCH",
         "name": "pattern",
         "type": "pattern",
@@ -745,31 +801,31 @@ var commandsJSON = `{
       },
       {
         "command": "WHERE",
-        "name": ["field","min","max"],
-        "type": ["string","double","double"],
+        "name": ["field", "min", "max"],
+        "type": ["string", "double", "double"],
         "optional": true,
         "multiple": true
       },
       {
         "command": "WHEREIN",
-        "name": ["field","count","value"],
-        "type": ["string","integer","double"],
+        "name": ["field", "count", "value"],
+        "type": ["string", "integer", "double"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVAL",
-        "name": ["script","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["script", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVALSHA",
-        "name": ["sha1","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["sha1", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
@@ -850,7 +906,7 @@ var commandsJSON = `{
           },
           {
             "name": "ROAM",
-            "arguments":[
+            "arguments": [
               {
                 "name": "key",
                 "type": "string"
@@ -874,7 +930,7 @@ var commandsJSON = `{
   "WITHIN": {
     "summary": "Searches for ids that completely within the area",
     "complexity": "O(log(N)) where N is the number of ids in the area",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -892,12 +948,6 @@ var commandsJSON = `{
         "optional": true
       },
       {
-        "command": "SPARSE",
-        "name": "spread",
-        "type": "integer",
-        "optional": true
-      },
-      {
         "command": "MATCH",
         "name": "pattern",
         "type": "pattern",
@@ -905,31 +955,31 @@ var commandsJSON = `{
       },
       {
         "command": "WHERE",
-        "name": ["field","min","max"],
-        "type": ["string","double","double"],
+        "name": ["field", "min", "max"],
+        "type": ["string", "double", "double"],
         "optional": true,
         "multiple": true
       },
       {
         "command": "WHEREIN",
-        "name": ["field","count","value"],
-        "type": ["string","integer","double"],
+        "name": ["field", "count", "value"],
+        "type": ["string", "integer", "double"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVAL",
-        "name": ["script","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["script", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVALSHA",
-        "name": ["sha1","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["sha1", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
@@ -1006,7 +1056,7 @@ var commandsJSON = `{
           },
           {
             "name": "BOUNDS",
-            "arguments":[
+            "arguments": [
               {
                 "name": "minlat",
                 "type": "double"
@@ -1027,7 +1077,7 @@ var commandsJSON = `{
           },
           {
             "name": "OBJECT",
-            "arguments":[
+            "arguments": [
               {
                 "name": "geojson",
                 "type": "geojson"
@@ -1053,7 +1103,7 @@ var commandsJSON = `{
           },
           {
             "name": "TILE",
-            "arguments":[
+            "arguments": [
               {
                 "name": "x",
                 "type": "double"
@@ -1070,7 +1120,7 @@ var commandsJSON = `{
           },
           {
             "name": "QUADKEY",
-            "arguments":[
+            "arguments": [
               {
                 "name": "quadkey",
                 "type": "string"
@@ -1085,6 +1135,31 @@ var commandsJSON = `{
                 "type": "geohash"
               }
             ]
+          },          
+          {
+            "name": "SECTOR",
+            "arguments": [
+              {
+                "name": "lat",
+                "type": "double"
+              },
+              {
+                "name": "lon",
+                "type": "double"
+              },
+              {
+                "name": "radius",
+                "type": "double"
+              },
+              {
+                "name": "startBearing",
+                "type": "double"
+              },
+              {
+                "name": "endBearing",
+                "type": "double"
+              }
+            ]
           }
         ]
       }
@@ -1095,7 +1170,7 @@ var commandsJSON = `{
   "INTERSECTS": {
     "summary": "Searches for ids that intersect an area",
     "complexity": "O(log(N)) where N is the number of ids in the area",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -1113,12 +1188,6 @@ var commandsJSON = `{
         "optional": true
       },
       {
-        "command": "SPARSE",
-        "name": "spread",
-        "type": "integer",
-        "optional": true
-      },
-      {
         "command": "MATCH",
         "name": "pattern",
         "type": "pattern",
@@ -1126,31 +1195,31 @@ var commandsJSON = `{
       },
       {
         "command": "WHERE",
-        "name": ["field","min","max"],
-        "type": ["string","double","double"],
+        "name": ["field", "min", "max"],
+        "type": ["string", "double", "double"],
         "optional": true,
         "multiple": true
       },
       {
         "command": "WHEREIN",
-        "name": ["field","count","value"],
-        "type": ["string","integer","double"],
+        "name": ["field", "count", "value"],
+        "type": ["string", "integer", "double"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVAL",
-        "name": ["script","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["script", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
       },
       {
         "command": "WHEREEVALSHA",
-        "name": ["sha1","numargs","arg"],
-        "type": ["string","integer","string"],
+        "name": ["sha1", "numargs", "arg"],
+        "type": ["string", "integer", "string"],
         "optional": true,
         "multiple": true,
         "variadic": true
@@ -1233,7 +1302,7 @@ var commandsJSON = `{
           },
           {
             "name": "BOUNDS",
-            "arguments":[
+            "arguments": [
               {
                 "name": "minlat",
                 "type": "double"
@@ -1254,7 +1323,7 @@ var commandsJSON = `{
           },
           {
             "name": "OBJECT",
-            "arguments":[
+            "arguments": [
               {
                 "name": "geojson",
                 "type": "geojson"
@@ -1280,7 +1349,7 @@ var commandsJSON = `{
           },
           {
             "name": "TILE",
-            "arguments":[
+            "arguments": [
               {
                 "name": "x",
                 "type": "double"
@@ -1297,7 +1366,7 @@ var commandsJSON = `{
           },
           {
             "name": "QUADKEY",
-            "arguments":[
+            "arguments": [
               {
                 "name": "quadkey",
                 "type": "string"
@@ -1312,6 +1381,31 @@ var commandsJSON = `{
                 "type": "geohash"
               }
             ]
+          },
+          {
+            "name": "SECTOR",
+            "arguments": [
+              {
+                "name": "lat",
+                "type": "double"
+              },
+              {
+                "name": "lon",
+                "type": "double"
+              },
+              {
+                "name": "radius",
+                "type": "double"
+              },
+              {
+                "name": "startBearing",
+                "type": "double"
+              },
+              {
+                "name": "endBearing",
+                "type": "double"
+              }
+            ]
           }
         ]
       }
@@ -1321,7 +1415,7 @@ var commandsJSON = `{
   },
   "CONFIG GET": {
     "summary": "Get the value of a configuration parameter",
-    "arguments":[
+    "arguments": [
       {
         "name": "parameter",
         "type": "string"
@@ -1331,7 +1425,7 @@ var commandsJSON = `{
   },
   "CONFIG SET": {
     "summary": "Set a configuration parameter to the given value",
-    "arguments":[
+    "arguments": [
       {
         "name": "parameter",
         "type": "string"
@@ -1346,18 +1440,18 @@ var commandsJSON = `{
   },
   "CONFIG REWRITE": {
     "summary": "Rewrite the configuration file with the in memory configuration",
-    "arguments":[],
+    "arguments": [],
     "group": "server"
   },
   "SERVER": {
-    "summary":"Show server stats and details",
+    "summary": "Show server stats and details",
     "complexity": "O(1)",
     "arguments": [],
     "since": "1.0.0",
     "group": "server"
   },
   "GC": {
-    "summary":"Forces a garbage collection",
+    "summary": "Forces a garbage collection",
     "complexity": "O(1)",
     "arguments": [],
     "since": "1.0.0",
@@ -1368,14 +1462,14 @@ var commandsJSON = `{
     "complexity": "O(1)",
     "arguments": [
       {
-        "enum": ["yes","no"]
+        "enum": ["yes", "no"]
       }
     ],
     "since": "1.0.0",
     "group": "server"
   },
   "FLUSHDB": {
-    "summary":"Removes all keys",
+    "summary": "Removes all keys",
     "complexity": "O(1)",
     "arguments": [],
     "since": "1.0.0",
@@ -1501,7 +1595,7 @@ var commandsJSON = `{
         "name": ["name", "value"],
         "type": ["string", "string"],
         "optional": true,
-		    "multiple": true
+        "multiple": true
       },
       {
         "command": "EX",
@@ -1539,7 +1633,6 @@ var commandsJSON = `{
         "type": "string",
         "variadic": true
       }
-
     ],
     "group": "webhook"
   },
@@ -1555,7 +1648,7 @@ var commandsJSON = `{
   },
   "HOOKS": {
     "summary": "Finds all hooks matching a pattern",
-    "arguments":[
+    "arguments": [
       {
         "name": "pattern",
         "type": "pattern"
@@ -1565,7 +1658,7 @@ var commandsJSON = `{
   },
   "PDELHOOK": {
     "summary": "Removes all hooks matching a pattern",
-    "arguments":[
+    "arguments": [
       {
         "name": "pattern",
         "type": "pattern"
@@ -1586,7 +1679,7 @@ var commandsJSON = `{
         "name": ["name", "value"],
         "type": ["string", "string"],
         "optional": true,
-		    "multiple": true
+        "multiple": true
       },
       {
         "command": "EX",
@@ -1624,7 +1717,6 @@ var commandsJSON = `{
         "type": "string",
         "variadic": true
       }
-
     ],
     "group": "pubsub"
   },
@@ -1640,7 +1732,7 @@ var commandsJSON = `{
   },
   "CHANS": {
     "summary": "Finds all channels matching a pattern",
-    "arguments":[
+    "arguments": [
       {
         "name": "pattern",
         "type": "pattern"
@@ -1650,7 +1742,7 @@ var commandsJSON = `{
   },
   "PDELCHAN": {
     "summary": "Removes all channels matching a pattern",
-    "arguments":[
+    "arguments": [
       {
         "name": "pattern",
         "type": "pattern"
@@ -1660,7 +1752,7 @@ var commandsJSON = `{
   },
   "SUBSCRIBE": {
     "summary": "Subscribe to a geofence channel",
-    "arguments":[
+    "arguments": [
       {
         "name": "channel",
         "type": "string",
@@ -1671,7 +1763,7 @@ var commandsJSON = `{
   },
   "PSUBSCRIBE": {
     "summary": "Subscribes the client to the given patterns",
-    "arguments":[
+    "arguments": [
       {
         "name": "pattern",
         "type": "pattern",
@@ -1682,12 +1774,12 @@ var commandsJSON = `{
   },
   "PDEL": {
     "summary": "Removes all objects matching a pattern",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
       },
-	  {
+      {
         "name": "pattern",
         "type": "pattern"
       }
@@ -1697,7 +1789,7 @@ var commandsJSON = `{
   "JGET": {
     "summary": "Get a value from a JSON document",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -1722,7 +1814,7 @@ var commandsJSON = `{
   "JSET": {
     "summary": "Set a value in a JSON document",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -1757,7 +1849,7 @@ var commandsJSON = `{
   "JDEL": {
     "summary": "Delete a value from a JSON document",
     "complexity": "O(1)",
-    "arguments":[
+    "arguments": [
       {
         "name": "key",
         "type": "string"
@@ -1773,7 +1865,7 @@ var commandsJSON = `{
     ],
     "group": "keys"
   },
-  "EVAL":{
+  "EVAL": {
     "summary": "Evaluates a Lua script",
     "complexity": "Depends on the evaluated script",
     "arguments": [
@@ -1801,7 +1893,7 @@ var commandsJSON = `{
     "since": "1.10.0",
     "group": "scripting"
   },
-  "EVALSHA":{
+  "EVALSHA": {
     "summary": "Evaluates a Lua script cached on the server by its SHA1 digest",
     "complexity": "Depends on the evaluated script",
     "arguments": [
@@ -1829,7 +1921,7 @@ var commandsJSON = `{
     "since": "1.10.0",
     "group": "scripting"
   },
-  "EVALRO":{
+  "EVALRO": {
     "summary": "Evaluates a read-only Lua script",
     "complexity": "Depends on the evaluated script",
     "arguments": [
@@ -1857,7 +1949,7 @@ var commandsJSON = `{
     "since": "1.10.0",
     "group": "scripting"
   },
-  "EVALROSHA":{
+  "EVALROSHA": {
     "summary": "Evaluates a read-only Lua script cached on the server by its SHA1 digest",
     "complexity": "Depends on the evaluated script",
     "arguments": [
@@ -1885,7 +1977,7 @@ var commandsJSON = `{
     "since": "1.10.0",
     "group": "scripting"
   },
-  "EVALNA":{
+  "EVALNA": {
     "summary": "Evaluates a Lua script in a non-atomic fashion",
     "complexity": "Depends on the evaluated script",
     "arguments": [
@@ -1913,7 +2005,7 @@ var commandsJSON = `{
     "since": "1.10.0",
     "group": "scripting"
   },
-  "EVALNASHA":{
+  "EVALNASHA": {
     "summary": "Evaluates, in a non-atomic fashion, a Lua script cached on the server by its SHA1 digest",
     "complexity": "Depends on the evaluated script",
     "arguments": [
@@ -1941,7 +2033,7 @@ var commandsJSON = `{
     "since": "1.10.0",
     "group": "scripting"
   },
-  "SCRIPT EXISTS":{
+  "SCRIPT EXISTS": {
     "summary": "Returns information about the existence of the scripts in server cache",
     "complexity": "O(N) where N is the number of provided sha1 arguments",
     "arguments": [
@@ -1954,7 +2046,7 @@ var commandsJSON = `{
     "since": "1.10.0",
     "group": "scripting"
   },
-  "SCRIPT LOAD":{
+  "SCRIPT LOAD": {
     "summary": "Loads the compiled version of a script into the server cache, without executing",
     "complexity": "O(N) where N is the number of bytes in the script",
     "arguments": [
@@ -1966,13 +2058,13 @@ var commandsJSON = `{
     "since": "1.10.0",
     "group": "scripting"
   },
-  "SCRIPT FLUSH":{
+  "SCRIPT FLUSH": {
     "summary": "Flushes the server cache of Lua scripts",
     "complexity": "O(1)",
     "since": "1.10.0",
     "group": "scripting"
   },
-  "TEST":{
+  "TEST": {
     "summary": "Performs spatial test",
     "complexity": "One test per command, complexity depends on the test",
     "arguments": [
@@ -2007,7 +2099,7 @@ var commandsJSON = `{
           },
           {
             "name": "BOUNDS",
-            "arguments":[
+            "arguments": [
               {
                 "name": "minlat",
                 "type": "double"
@@ -2028,7 +2120,7 @@ var commandsJSON = `{
           },
           {
             "name": "OBJECT",
-            "arguments":[
+            "arguments": [
               {
                 "name": "geojson",
                 "type": "geojson"
@@ -2054,7 +2146,7 @@ var commandsJSON = `{
           },
           {
             "name": "TILE",
-            "arguments":[
+            "arguments": [
               {
                 "name": "x",
                 "type": "double"
@@ -2071,7 +2163,7 @@ var commandsJSON = `{
           },
           {
             "name": "QUADKEY",
-            "arguments":[
+            "arguments": [
               {
                 "name": "quadkey",
                 "type": "string"
@@ -2137,7 +2229,7 @@ var commandsJSON = `{
           },
           {
             "name": "BOUNDS",
-            "arguments":[
+            "arguments": [
               {
                 "name": "minlat",
                 "type": "double"
@@ -2158,7 +2250,7 @@ var commandsJSON = `{
           },
           {
             "name": "OBJECT",
-            "arguments":[
+            "arguments": [
               {
                 "name": "geojson",
                 "type": "geojson"
@@ -2184,7 +2276,7 @@ var commandsJSON = `{
           },
           {
             "name": "TILE",
-            "arguments":[
+            "arguments": [
               {
                 "name": "x",
                 "type": "double"
@@ -2201,7 +2293,7 @@ var commandsJSON = `{
           },
           {
             "name": "QUADKEY",
-            "arguments":[
+            "arguments": [
               {
                 "name": "quadkey",
                 "type": "string"

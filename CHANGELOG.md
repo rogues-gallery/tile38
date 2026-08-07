@@ -2,14 +2,492 @@
 All notable changes to this project will be documented in this file.
 This project adheres to [Semantic Versioning](http://semver.org/).
 
-## [1.17.2] - 2019-06-28
+## [1.38.0] = 2026-06-08
+### Added 
+- #806: Support multiple Kafka broker addresses in endpoint URL (@badaverse)
+- #799: Add RX option for inline object response in SET and FSET (@XanderD99)
+- #811: MQTT add SSL and user (@bqstony)
 
-### Fixes
+### Fixed
+- 194107f: Apply WHERE clause check for cross detection in geofence hooks (@majiayu000)
+- b3902cf: Distinguish between hooks and channels in RENAME error message (@majiayu000)
+- e16c198: Fix lock (@rohanri)
+- #812: Added amqp channel closure on error and connection expiry on closure (@FranklinLimWest)
+
+### Updated
+- c279114: Go 1.26
+- Update various Go dependencies
+
+## [1.37.0] = 2026-01-06
+### Added
+- #791: Add regexp to where expressions using '=~' (@TomDeVito)
+
+### Fixed
+- #793: Avoid NaN points and rects for insertions and searches (@krkeshav)
+- #789: Fix LineString feature encoding to use all points (@metaxasa)
+- 45496a0: Ensure strict resp clients for pubsub
+- f6e6fae: Ignore -o json flag for HELLO command
+
+### Updated
+- 653e7a0: Bumped github.com/eclipse/paho.mqtt.golang
+- 2a86b4b: Bumped golang.org/x/crypto
+
+## [1.36.5] = 2025-10-05
+### Added
+- 5462de9: Add -o flag to auto set client output to json or resp #779 (@huangpeizhi2018)
+
+### Fixed
+- 8c27bd7: Fix 'outside' detect not firing when 'cross' is present
+
+## [1.36.4] = 2025-10-03
+### Fixed
+- 8c9f56c: Fix leader hanging on sigterm #783 (@dobiadi)
+
+## [1.36.3] = 2025-09-26
+### Fixed
+- 684ad73: Fix panic, move pubq init cond #782 (@ayaIbrahimm)
+- cde0ef7: Do not throw Lua nil access error during scans
+
+## [1.36.2] = 2025-09-04
+### Fixed
+- 653aea6: Add GeoJSON "properties" member for Lua filtering
+- 70c244f: Make the String.match() function case insensitive
+
+## [1.36.1] = 2025-08-28
+### Updated
+- 53bed30: Update lock strategy for faster writes 
+- 40f58b0: Kafka Endpoint Improvement #778 (@ifiok)
+- 82f4d24: Smaller vector tile sizes for polygons
+- 5b21c24: Auto clip geometries at low zoom levels
+
+## [1.36.0] = 2025-07-14
+### Added
+- 35bde95: Support for Cloudflare Queues endpoint #773 (@tobilg)
+- a2afb21: Vector tile support (Mapbox vector tiles) #775
+
+### Updated
+- 56c70a1: Bumped github.com/golang-jwt/jwt/v4
+- 86b698d: Updated Go dependencies
+- f95fcab: Go 1.25
+
+## [1.35.0] = 2025-06-16
+### Added
+- 4638279: Added NATS Jetstream acks, user credentials, and tls #770 (@VeryStrongFingers)
+
+### Updated
+- 3fe57a7; Use atomics for HEALTHZ command to remove contention.
+- 3085316: Expose the 'this' property to WHERE clauses.
+
+## [1.34.4] = 2025-05-08
+### Fixed
+- 977bf25: Fix issue with some startup flags not being read (@salilgupta1)
+
+### Updated
+- 86333cd: Bump golang.org/x/net #767
+
+## [1.34.3] = 2025-04-16
+### Fixed
+- dd98481: Fix channel message delay #763 (@txtsd)
+
+## [1.34.2] = 2025-04-01
+### Updated
+- a80eaf2: Upgrade to Go 1.24
+
+### Fixed
+- 556390e: Fix equality tests with WHERE clause for nested values
+- 42e17a1: Fix channel test that sometimes stalls
+
+### Security
+- 0ecf097: Bump golang.org/x/net #765
+
+## [1.34.1] = 2025-01-13
+### Security
+- 927f382: CVE-2024-45338 golang.org/x/net #762 (@tduong2049)
+- 07389d8: CVE-2024-45337 golang.org/x/crypto #760
+
+## [1.34.0] = 2024-12-09
+### Added 
+- 459b3e6: Added fifo support for SQS webhooks #759 (@crankycookie)
+
+### Updated
+- bed590b: Upgrade to Alpine 3.20 #757 (@tduong2049)
+- 2b09508: Upgrade to Go 1.23
+
+## [1.33.4] = 2024-11-05
+### Fixed
+- aa1caa6: Use zero for undefined fields in where expressions #754 (@unendingblue)
+
+## [1.33.3] = 2024-09-29
+### Fixed
+- 2b080f4: Include field to INFO replication command output #752 (@Kilowhisky)
+
+## [1.33.2] = 2024-08-02
+### Fixed
+- 2e3eaa7: Remove extra quote in ROLE command with JSON output #749 (@Kilowhisky)
+
+## [1.33.1] = 2024-07-02
+### Fixed
+- 193bce1: Fix followers not receiving channel messages #468 (@hibooboo2, @trendstate, @DoisKoh)
+
+## [1.33.0] = 2024-05-03
+## Added
+- #726: Add EXIST and FEXIST command (@Kilowhisky)
+
+## Fixed
+- #738: Add support for CORS in http requests (@Kilowhisky)
+- #741: FSET transforms field names to lowercase (@unendingblue, @iwpnd)
+- #736: Fix field floating point parsing misrepresentation (@Kilowhisky)
+
+## Updated
+- #733: golang.org/x/net
+- #724: google.golang.org/protobuf
+
+## [1.32.2] = 2024-02-14
+### Fixed
+- #714: Fix crash when mixing z-coord dimensionality in a geometry (@prathik)
+- #717: Metric expired_keys never incremented (@undeadcat)
+- Updated Go runtime to 1.22
+
+## [1.32.1] = 2023-11-20
+### Fixed
+- #711: Updated dependencies to address security vulnerabilities (@hcmf-wice)
+- #706: Add support for 'none' authentication for kafka while still allowing SSL (@Kilowhisky)
+- #702: Fix AWS SQS base domain parsing for China region (@LLluma)
+
+## [1.32.0] = 2023-07-31
+### Added
+- #686: Support the ROLE command (@Kilowhisky)
+
+### Fixed
+- #698: Allow AUTH while loading data (@Kilowhisky)
+- #694: Allow PING in pubsub (@Kilowhisky)
+- #692: Properly support replica_announce properties (@Kilowhisky)
+- #691: HEALTHZ should not be AUTH protected (@Kilowhisky)
+- #685: Heap size not coming down after objects are removed (@Mukund2900, @iwpnd)
+- 0144ca6: Fix missing lock
+
+## [1.31.0] = 2023-05-09
+### Added
+- #682: Enables cross platform building and pushing of docker images (arm64/amd64) (@eelcocramer)
+- #680: Add hostname, port, output, and password env variables to tile38-cli (@ptsilva)
+
+### Fixed
+- #606: Only create AMQP queue and bindings for non-topic exchanges (@pacaj2am, @uwer)
+- #672: Add graceful shutdown on SIGTERM (@dmitri-zganiaiko)
+
+### Updated
+- e9a0500: Upgrade to Go 1.20
+- 05b2fb9: Security updates
+
+## [1.30.2] = 2022-12-29
+### Fixed
+- #668: Fixed fields not persisting (@DucPhan2997)
+
+## [1.30.1] = 2022-12-14
+### Fixed
+- a8c92a0: Speed up leader/follower replication
+- e60ea70: Fix field names converting to lowercase
+
+## [1.30.0] = 2022-11-22
+### Added
+- bdc80a7: Add WHERE expressions ([more info](https://tile38.com/topics/filter-expressions))
+- f24c251: Allow for multiple MATCH patterns
+- #652: Allow WHERE for geofence detection
+- #657: Add distance to NEARBY IDS response (@iwpnd)
+- #663: Lua Sanitization (@program--)
+
+### Fixed
+- 023433a: Fix server hang on shared address
+- #655: fix: allow host ca sets for SASL and TLS connections (@iwpnd)
+
+### Updated
+- 7f2ce23: Upgrade to Go 1.19
+- cbfb271: Updated data structures to use Go generics
+
+## [1.29.2] = 2022-11-11
+### Fixed
+- #664: Fix bad line in inner ring response
+
+## [1.29.1] = 2022-09-21
+### Fixed
+- fe180dc: Fix follower not authenticating after aofshink
+
+## [1.29.0] = 2022-07-14
+### Added
+- b883f35: Add pending_events stat
+- #643: Expose config and INFO response for replia-priorty (@rave-eserating)
+
+### Fixed
+- 8e61f81: Fixed test on Apple silicon
+
+## [1.28.0] = 2022-04-12
+### Added
+- 10f8564: Added option to "not found" for DEL
+- #633: Added "clear" command in the tile38-cli (@CaioDallaqua)
+- #634: Added -x flag to tile38-cli (@sign0)
+
+### Fixed
+- #636: Workaround for the RESP3 Java lettuce client (@rave-eserating)
+- a1cc8e6: Fix eof error for incomplete commands (Theresa D)
+
+### Updated
+- fcdb469: Security updates
+- #638: Upgrade alpine in Dockerfile (@bb)
+- a124738: Upgrade to Go 1.18
+- 38ea913: Upgrade prometheous client
+- 45fde6a: Upgraded nats dependencies
+
+## [1.27.1] = 2021-01-04
+### Fix
+- b6833a2: Auto assign server_id for bootstrapped config files
+
+## [1.27.0] = 2021-12-28
+### Added
+- #629: JSON logging (@iwpnd)
+- 241117c: BUFFER option for WITHIN and INTERSECTS, see #79
+
+## [1.26.4] = 2021-10-25
+### Hotfix
+- a7592f7: Bump version to match changelog
+
+## [1.26.3] = 2021-10-25
+### Updated
+- a47443a: Upgrade tidwall modules
+
+## [1.26.2] = 2021-10-22
+### Added
+- #625: Azure EventHub hook support
+
+### Changed
+- 11cea4d: Removed vendor directory
+
+## [1.26.1] = 2021-10-01
+### Updated
+- 9e552c3: Allow some basic client commands before AOF data loads
+
+## [1.26.0] = 2021-09-29
+### Added
+- #623: Added SECTOR type to spatial searches (@iwpnd, @gmonk)
+
+### Fixed
+- #624: AOFSHRINK causes panic on server (@saques)
+
+## [1.25.5] = 2021-09-26
+### Fixed
+- 8ebcbeb: Fixed Z not matching on where clause for Feature/Point. (@tomquas)
+
+## [1.25.4] = 2021-09-14
+### Added
+- a737a78: Add unix socket support
+
+### Updated
+- 8829b8f: Change hooks collection type from hashmap to btree
+- 83094b2: Update hook expiration logic
+- c686b87: Return hook ttl with HOOKS request
+- 06a92d8: Increase the precision of TIMEOUT
+- Upgrade to Go 1.17.1
+
+## [1.25.3] = 2021-08-23
+### Fixed
+- #621: Fixed a memory leak (@Morgiflute)
+
+### Updated
+- Update B-tree library
+- Upgrade to Go 1.17
+
+## [1.25.2] = 2021-08-10
+### Fixed
+- #620: Fixed kafka authentication methods
+
+### Updated
+- Upgraded various dependencies
+
+## [1.25.1] = 2021-07-22
+### Fixed
+- #618: Fixed NEARBY with SPARSE returning too many results. (@nesjett)
+
+## [1.25.0] = 2021-07-12
+### Added
+- #504: Added TLS support for Nats webhook provider.
+- #552: Add CLIPBY subcommand to INTERSECTS/WITHIN. (@rshura)
+- #561: Added geofence webhook for GCP Pubsub. (@mscno)
+- #615: Add SASL to Kafka provider. (@mathieux51, @iwpnd)
+
+### Updated
+- #551: Optimize field value access. (@mpoindexter)
+- #554: Improved kNN using geodesic algorithm for NEARBY command. (@mpoindexter)
+
+### Fixed
+- #611: Close follower files before finishing aofshrink. (@mzbrau)
+- #613: Fix Memory Leak in Kafka Producer. (@iwpnd)
+- #616: Fixed expiration logic issue. (@Neuintown)
+
+## [1.24.3] = 2021-06-09
+### Fixed
+- af43d5a: Hotfix. Fixed invalid healthz output.
+
+## [1.24.2] = 2021-06-07
+### Updated
+- b610633: Update Go to 1.16
+
+## [1.24.1] = 2021-06-07
+### Added
+- #609: Added HEALTHZ command (@iwpnd, @stevelacy)
+
+## [1.24.0] = 2021-05-19
+### Added
+- #604: Added Prometheus metrics (@oliver006)
+
+### Fixed
+- #605: Remove deprecated threads flag (@cep-ter) 
+
+## [1.23.0] = 2021-04-01
+### Updated
+- #598: Added TLS Config to Kafka (@iwpnd)
+- #599: Include "distance" to output when user specifically requests (@iwpnd)
+- #597: Allow for all command types for roaming event (@johnpmayer)
+- 31a0fbd: Upgraded dependencies and moved to Go 1.16
+
+### Fixed
+- #600: Fix invalid queue.db error (@lokisisland)
+- #603: Fix tile38-cli output showing protocol size when piping (@bb)
+
+## [1.22.6] = 2021-02-07
+### Updated
+- 72dfaae: Updated various dependencies
+- 016f397: Updated btree library, optimization 
+- 4f8bc05: Updated rtree library, optimization
+
+### Fixed
+- 6092f73: Better handle connection errors in tile38-cli
+
+## [1.22.5] = 2020-11-09
+### Fixed
+- 9ce2033: Fixed fields being shuffled after AOFSHRINK
+
+## [1.22.4] = 2020-11-07
+### Updated
+- 1a7d8d6: Added ENV var for 500 http errors
+
+## [1.22.3] = 2020-10-28
+### Updated
+- #583: Optimization for non-"cross" based geofence detection (@cliedeman)
+- 79bee85: Replaced the underlying B-tree structure.
+
+## [1.22.2] = 2020-10-07
+### Fixed
+- #230: Fix trailing zeros in AOF at startup
+
+## [1.22.1] = 2020-09-22
+### Updated
+- 9a34a37: Updated Go version to 1.15
+- b1dc463: Updated outdated dependencies (40 in total)
+
+### Added
+- #578 Fix "cross" detection not firing in some cases (@feichler-or)
+
+## [1.22.0] = 2020-08-12
+### Added
+- #571 Added MONITOR command (@tomquas)
+
+### Fixed
+- #566: Fixed crash in fenceMatchRoam causing an index out of range panic (@larsw)
+- #569: Fixed wrong order for fields with SCAN (@ipsusila)
+- #573: Fixed crash with geohash precision above 12 (@superloach)
+- 68e2b6d: Updated Kafka client to support (@LeonardoBonacci)
+
+## [1.21.1] = 2020-06-04
+### Fixed
+- #564: Fix OUTPUT client command requiring authentication. (@LeonardoBonacci)
+
+## [1.20.0] = 2020-05-20
+### Updated
+- #534: Avoid sorting fields for each written object. (@rshura)
+- #544: Match geometry indexing to server config
+- b3dc025: Optimize point in ring
+- 3718cd7: Added priority option for AMQP endpoints
+
+### Fixed
+- #538: DEL geofence notifications are missing the "key" field
+- #539: Fixed issue with some features not working with WITHIN (@rshura)
+- #540: Fix a concurrent write/read on the server conn map (@mpoindexter)
+- #543: Fix clipping empty rings (@rshura)
+- #558: Fixed clip test (@mmcloughlin)
+- #562: Crashes under go1.14 runtime
+- ff48054: Fixed a missing faraway event for roaming geofences
+- 5162ac5: Stable sort roam notifications
+
+## [1.19.5] = 2020-02-11
+### Fixed
+- c567512: Fix packages not vendoring on build
+
+## [1.19.4] = 2020-02-10
+### Fixed
+- #529: Fix linestring features behave diffrent with CIRCLE (@spierepf)
+
+## [1.19.3] = 2019-12-11
+### Fixed
+- #513: Fix tile38-cli from freezing with non-quoted geojson (@duartejc)
+
+## [1.19.2] = 2019-11-28
+### Fixed
+- 6f3716a: Fix false negative for intersecting rings (@thomascoquet)
+
+## [1.19.1] = 2019-11-18
+### Updated
+- cfc65a1: Refactored repo, moved to Go modules, updated vendor dependencies.
+
+### Fixed
+- 9d27533: Fix infinite loop on tile38-cli connection failure.
+- #509: Fixed panic on AOFSHRINK. (@jordanferenz)
+
+## [1.19.0] = 2019-11-02
+### Added
+- #464: Add area expressions TEST command. (@rshura)
+
+### Fixed
+- #493: Fix invalid JSON when JSET strings that look like numbers. (@spierepf, @JordanArmstrong)
+- #499: Fix invalid PubSub format when output is set to JSON. (@dmvass)
+- #500: Fix Tile38-cli not propertly handling quotes. (@vthorsell)
+- #502: Fix excessive memory usage for objects with TTLs. commit 23b016d. (@FreakyBytes)
+- #503: Fix fprintf type error in stats_cpu.go for non-linux/darwin builds. (@JordanArmstrong)
+
+### Changed
+- #505: Update Travi-ci to use Go 1.13.x
+
+## [1.18.0] = 2019-10-09
+### Updated
+- 639f6e2: Updated the spatial index (R-tree) implementation.
+
+### Fixed
+- b092cea: Fixed MQTT blocking on publish/wait.
+- #496: Fixed MQTT client ID uniqueness. (@neterror)
+- #497: Fixed data race on webhook map with TTLs. (@belek)
+- #498: Fixed JSET cancels objects TTL expiry value. (@belek)
+
+## [1.17.6] - 2019-08-22
+### Fixed
+- 3d96b17: Fixed periodic stop-the-world pauses for systems with large heaps.
+
+## [1.17.5] - 2019-08-22
+### Fixed
+- #489: Fixed nearby count always one (@jkarjala)
+
+## [1.17.4] - 2019-08-09
+### Fixed
+- #486: Fixed data condition on connections map (@saltatory)
+
+## [1.17.3] - 2019-08-03
+### Fixed
+- #483: Fixed lua pool pruning (@rshura)
+- f7888c1: Fixed malformed json for chans command
+
+## [1.17.2] - 2019-06-28
+### Fixed
 - #422: Fixes NEARBY command distance normalization issue (@TrivikrAm-Pamarthi, @melbania)
 
 ## [1.17.1] - 2019-05-04
-
-### Fixes
+### Fixed
 - #448: Fixed missing commands for unsubscribing from active channel (@githubfr)
 - #454: Fixed colored output for fatalf (@olevole)
 - #453: Fixed nearby json field results showing wrong data (@melbania)
@@ -18,18 +496,18 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 ### Added
 - #446: Added timeouts to allow prepending commands with a TIMEOUT option. (@rshura)
 
-### Fixes
+### Fixed
 - #440: Fixed crash with fence ROAM (@githubfr)
 
-### Changes
+### Changed
 - 3ae5927: Removed experimental evio option
 
 ## [1.16.4] - 2019-03-19
-### Fixes
+### Fixed
 - e1a7145: Hotfix. Do not ignore SIGHUP. Use the `--nohup` flag or `nohup` command.
 
 ## [1.16.3] - 2019-03-19
-### Fixes
+### Fixed
 - #437: Fixed clients blocking while webook sending. (@tesujiro)
 
 ### Added
@@ -39,18 +517,18 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - 5335aec: Allow for standard SQS URLs. (@tobilg)
 
 ## [1.16.2] - 2019-03-12
-### Fixes
+### Fixed
 - #432: Ignore SIGHUP signals. (@abhit011)
 - #433: Fixed nearby inaccuracy with geofence. (@stcktrce)
 - #429: Memory optimization, recycle AOF buffer.
 - 95a5556: Added periodic yielding to iterators. (@rshura)
 
 ## [1.16.1] - 2019-03-01
-### Fixes
+### Fixed
 - #421: Nearby with MATCH is returning invalid results (@nithinkota)
 
 ## [1.16.0] - 2019-02-25
-### Fixes
+### Fixed
 - #415: Fixed overlapping geofences sending notifcation to wrong endpoint. (@belek, @s32x)
 - #412: Allow SERVER command for Lua scripts. (@1995parham)
 - #410: Allow slashes in MQTT Topics (@pstuifzand)
@@ -63,7 +541,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - #404: Adding more replication data to INFO response. (@s32x)
 
 ## [1.15.0] - 2019-01-16
-### Fixes
+### Fixed
 - #403: JSON Output for INFO and CLIENT (@s32x)
 - #401: Fixing KEYS command (@s32x)
 - #398: Ensuring channel publish order (@s32x)
@@ -76,7 +554,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - #395: Add RENAME and RENAMENX commands. (@rshura)
 
 ## [1.14.4] - 2018-12-03
-### Fixes
+### Fixed
 - #394: Hotfix MultiPolygon intersect failure. (@contra)
 - #392: Fix TLS certs missing in Docker. (@vziukas, @s32x)
 
@@ -86,15 +564,15 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - Add optimized spatial index for fences
 
 ## [1.14.3] - 2018-11-20
-### Fixes
+### Fixed
 - Hotfix SCRIPT LOAD not executing from cli. (@rshura)
 
 ## [1.14.2] - 2018-11-15
-### Fixes
+### Fixed
 - #386: Fix version not being set at build. (@stevelacy)
 
 ## [1.14.1] - 2018-11-15
-### Fixes
+### Fixed
 - #385: Add `version` to SERVER command response (@stevelacy)
 - Hotfix replica sync needs flushing (@rshura)
 - Fixed a bug where some AOF commands where corrupted during reload
@@ -107,7 +585,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - kNN haversine distance optimization (@rshura)
 - Evio networking beta using the "-evio yes" and "-threads num" flags
 
-### Fixes
+### Fixed
 - #369: Fix poly in hole query
 
 ## [1.13.0] - 2018-08-29
@@ -118,7 +596,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - #340: Add MQTT tls/cert options (@tobilg)
 - #314: Add CLIP subcommand to INTERSECTS (@rshura)
 
-### Changes
+### Changed
 - 3ae26e3: Updated B-tree implementation
 - 1d78a41: Updated R-tree implementation
 
@@ -145,7 +623,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - 11b42c0: Option to disable AOF or to use a custom path: #220 #223 #297 (@sign0, @umpc, @fmr683, @zhangfeng158)
 - #296: Add Meta data to hooks command (@tobilg)
 
-### Changes
+### Changed
 - 11b42c0: Updated help menu and show more options
 
 ### Fixed
@@ -357,7 +835,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - Added OUTPUT command to allow for outputing JSON when using RESP
 - Added DETECT option to geofences
 
-### Changes
+### Changed
 - New AOF file structure.
 - Quicker and safer AOFSHRINK.
 

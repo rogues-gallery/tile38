@@ -2,73 +2,45 @@ package server
 
 import (
 	"bytes"
-	"sort"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
+	a5 "github.com/a5geo/a5-go"
 	"github.com/mmcloughlin/geohash"
-	"github.com/tidwall/boxtree/d2"
 	"github.com/tidwall/geojson"
 	"github.com/tidwall/geojson/geometry"
 	"github.com/tidwall/resp"
 	"github.com/tidwall/tile38/internal/collection"
+	"github.com/tidwall/tile38/internal/field"
 	"github.com/tidwall/tile38/internal/glob"
-	"github.com/tidwall/tinybtree"
+	"github.com/tidwall/tile38/internal/object"
 )
 
-type fvt struct {
-	field string
-	value float64
-}
-
-type byField []fvt
-
-func (a byField) Len() int {
-	return len(a)
-}
-func (a byField) Less(i, j int) bool {
-	return a[i].field < a[j].field
-}
-func (a byField) Swap(i, j int) {
-	a[i], a[j] = a[j], a[i]
-}
-
-func orderFields(fmap map[string]int, fields []float64) []fvt {
-	var fv fvt
-	fvs := make([]fvt, 0, len(fmap))
-	for field, idx := range fmap {
-		if idx < len(fields) {
-			fv.field = field
-			fv.value = fields[idx]
-			if fv.value != 0 {
-				fvs = append(fvs, fv)
-			}
-		}
-	}
-	sort.Sort(byField(fvs))
-	return fvs
-}
-func (server *Server) cmdBounds(msg *Message) (resp.Value, error) {
+// BOUNDS key
+func (s *Server) cmdBOUNDS(msg *Message) (resp.Value, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
 
-	var ok bool
-	var key string
-	if vs, key, ok = tokenval(vs); !ok || key == "" {
-		return NOMessage, errInvalidNumberOfArguments
-	}
-	if len(vs) != 0 {
-		return NOMessage, errInvalidNumberOfArguments
-	}
+	// >> Args
 
-	col := server.getCol(key)
+	args := msg.Args
+	if len(args) != 2 {
+		return retrerr(errInvalidNumberOfArguments)
+	}
+	key := args[1]
+
+	// >> Operation
+
+	col, _ := s.cols.Get(key)
 	if col == nil {
 		if msg.OutputType == RESP {
 			return resp.NullValue(), nil
 		}
-		return NOMessage, errKeyNotFound
+		return retrerr(errKeyNotFound)
 	}
+
+	// >> Response
 
 	vals := make([]resp.Value, 0, 2)
 	var buf bytes.Buffer
@@ -84,122 +56,156 @@ func (server *Server) cmdBounds(msg *Message) (resp.Value, error) {
 	if msg.OutputType == JSON {
 		buf.WriteString(`,"bounds":`)
 		buf.WriteString(string(bbox.AppendJSON(nil)))
-	} else {
-		vals = append(vals, resp.ArrayValue([]resp.Value{
-			resp.ArrayValue([]resp.Value{
-				resp.FloatValue(minX),
-				resp.FloatValue(minY),
-			}),
-			resp.ArrayValue([]resp.Value{
-				resp.FloatValue(maxX),
-				resp.FloatValue(maxY),
-			}),
-		}))
-	}
-	switch msg.OutputType {
-	case JSON:
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
-	case RESP:
-		return vals[0], nil
 	}
-	return NOMessage, nil
+
+	// RESP
+	vals = append(vals, resp.ArrayValue([]resp.Value{
+		resp.ArrayValue([]resp.Value{
+			resp.FloatValue(minX),
+			resp.FloatValue(minY),
+		}),
+		resp.ArrayValue([]resp.Value{
+			resp.FloatValue(maxX),
+			resp.FloatValue(maxY),
+		}),
+	}))
+	return vals[0], nil
 }
 
-func (server *Server) cmdType(msg *Message) (resp.Value, error) {
+// TYPE key
+// undocumented return "none" or "hash"
+func (s *Server) cmdTYPE(msg *Message) (resp.Value, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
 
-	var ok bool
-	var key string
-	if vs, key, ok = tokenval(vs); !ok || key == "" {
-		return NOMessage, errInvalidNumberOfArguments
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 2 {
+		return retrerr(errInvalidNumberOfArguments)
 	}
+	key := args[1]
 
-	col := server.getCol(key)
+	// >> Operation
+
+	col, _ := s.cols.Get(key)
 	if col == nil {
 		if msg.OutputType == RESP {
 			return resp.SimpleStringValue("none"), nil
 		}
-		return NOMessage, errKeyNotFound
+		return retrerr(errKeyNotFound)
 	}
+
+	// >> Response
 
 	typ := "hash"
 
-	switch msg.OutputType {
-	case JSON:
-		return resp.StringValue(`{"ok":true,"type":` + string(typ) + `,"elapsed":"` + time.Now().Sub(start).String() + "\"}"), nil
-	case RESP:
-		return resp.SimpleStringValue(typ), nil
+	if msg.OutputType == JSON {
+		return resp.StringValue(`{"ok":true,"type":` + jsonString(typ) +
+			`,"elapsed":"` + time.Since(start).String() + "\"}"), nil
 	}
-	return NOMessage, nil
+	return resp.SimpleStringValue(typ), nil
 }
 
-func (server *Server) cmdGet(msg *Message) (resp.Value, error) {
+// GET key id [WITHFIELDS] [OBJECT|POINT|BOUNDS|(HASH geohash)]
+func (s *Server) cmdGET(msg *Message) (resp.Value, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
 
-	var ok bool
-	var key, id, typ, sprecision string
-	if vs, key, ok = tokenval(vs); !ok || key == "" {
-		return NOMessage, errInvalidNumberOfArguments
+	// >> Args
+
+	args := msg.Args
+
+	if len(args) < 3 {
+		return retrerr(errInvalidNumberOfArguments)
 	}
-	if vs, id, ok = tokenval(vs); !ok || id == "" {
-		return NOMessage, errInvalidNumberOfArguments
-	}
+	key, id := args[1], args[2]
 
 	withfields := false
-	if _, peek, ok := tokenval(vs); ok && strings.ToLower(peek) == "withfields" {
-		withfields = true
-		vs = vs[1:]
+	kind := "object"
+	var precision int64
+	for i := 3; i < len(args); i++ {
+		switch strings.ToLower(args[i]) {
+		case "withfields":
+			withfields = true
+		case "object":
+			kind = "object"
+		case "point":
+			kind = "point"
+		case "bounds":
+			kind = "bounds"
+		case "hash":
+			kind = "hash"
+			i++
+			if i == len(args) {
+				return retrerr(errInvalidNumberOfArguments)
+			}
+			var err error
+			precision, err = strconv.ParseInt(args[i], 10, 64)
+			if err != nil || precision < 1 || precision > 12 {
+				return retrerr(errInvalidArgument(args[i]))
+			}
+		case "a5":
+			kind = "a5"
+			i++
+			if i == len(args) {
+				return retrerr(errInvalidNumberOfArguments)
+			}
+			var err error
+			precision, err = strconv.ParseInt(args[i], 10, 64)
+			if err != nil || !a5ValidResolution(int(precision)) {
+				return retrerr(errInvalidArgument(args[i]))
+			}
+		default:
+			return retrerr(errInvalidNumberOfArguments)
+		}
 	}
 
-	col := server.getCol(key)
+	// >> Operation
+
+	col, _ := s.cols.Get(key)
 	if col == nil {
 		if msg.OutputType == RESP {
 			return resp.NullValue(), nil
 		}
-		return NOMessage, errKeyNotFound
+		return retrerr(errKeyNotFound)
 	}
-	o, fields, ok := col.Get(id)
-	ok = ok && !server.hasExpired(key, id)
-	if !ok {
+	o := col.Get(id)
+	if o == nil {
 		if msg.OutputType == RESP {
 			return resp.NullValue(), nil
 		}
-		return NOMessage, errIDNotFound
+		return retrerr(errIDNotFound)
 	}
 
+	// >> Response
+
+	oval := buildObjectResponse(msg, o, start, kind, precision, withfields, msg.OutputType == JSON)
+
+	return oval, nil
+}
+
+func buildObjectResponse(msg *Message, o *object.Object, start time.Time, kind string, precision int64, withfields, json bool) resp.Value {
 	vals := make([]resp.Value, 0, 2)
 	var buf bytes.Buffer
 	if msg.OutputType == JSON {
 		buf.WriteString(`{"ok":true`)
 	}
-	vs, typ, ok = tokenval(vs)
-	typ = strings.ToLower(typ)
-	if !ok {
-		typ = "object"
-	}
-	switch typ {
-	default:
-		return NOMessage, errInvalidArgument(typ)
+	switch kind {
 	case "object":
 		if msg.OutputType == JSON {
 			buf.WriteString(`,"object":`)
-			buf.WriteString(string(o.AppendJSON(nil)))
+			buf.WriteString(string(o.Geo().AppendJSON(nil)))
 		} else {
-			vals = append(vals, resp.StringValue(o.String()))
+			vals = append(vals, resp.StringValue(o.Geo().String()))
 		}
 	case "point":
 		if msg.OutputType == JSON {
 			buf.WriteString(`,"point":`)
-			buf.Write(appendJSONSimplePoint(nil, o))
+			buf.Write(appendJSONSimplePoint(nil, o.Geo()))
 		} else {
-			point := o.Center()
-			var z float64
-			if gPoint, ok := o.(*geojson.Point); ok {
-				z = gPoint.Z()
-			}
+			point := o.Geo().Center()
+			z := extractZCoordinate(o.Geo())
 			if z != 0 {
 				vals = append(vals, resp.ArrayValue([]resp.Value{
 					resp.StringValue(strconv.FormatFloat(point.Y, 'f', -1, 64)),
@@ -214,18 +220,22 @@ func (server *Server) cmdGet(msg *Message) (resp.Value, error) {
 			}
 		}
 	case "hash":
-		if vs, sprecision, ok = tokenval(vs); !ok || sprecision == "" {
-			return NOMessage, errInvalidNumberOfArguments
-		}
 		if msg.OutputType == JSON {
 			buf.WriteString(`,"hash":`)
 		}
-		precision, err := strconv.ParseInt(sprecision, 10, 64)
-		if err != nil || precision < 1 || precision > 64 {
-			return NOMessage, errInvalidArgument(sprecision)
-		}
-		center := o.Center()
+		center := o.Geo().Center()
 		p := geohash.EncodeWithPrecision(center.Y, center.X, uint(precision))
+		if msg.OutputType == JSON {
+			buf.WriteString(`"` + p + `"`)
+		} else {
+			vals = append(vals, resp.StringValue(p))
+		}
+	case "a5":
+		if msg.OutputType == JSON {
+			buf.WriteString(`,"a5":`)
+		}
+		center := o.Geo().Center()
+		p, _ := a5EncodePoint(center.X, center.Y, int(precision))
 		if msg.OutputType == JSON {
 			buf.WriteString(`"` + p + `"`)
 		} else {
@@ -234,7 +244,7 @@ func (server *Server) cmdGet(msg *Message) (resp.Value, error) {
 	case "bounds":
 		if msg.OutputType == JSON {
 			buf.WriteString(`,"bounds":`)
-			buf.Write(appendJSONSimpleBounds(nil, o))
+			buf.Write(appendJSONSimpleBounds(nil, o.Geo()))
 		} else {
 			bbox := o.Rect()
 			vals = append(vals, resp.ArrayValue([]resp.Value{
@@ -250,84 +260,106 @@ func (server *Server) cmdGet(msg *Message) (resp.Value, error) {
 		}
 	}
 
-	if len(vs) != 0 {
-		return NOMessage, errInvalidNumberOfArguments
-	}
 	if withfields {
-		fvs := orderFields(col.FieldMap(), fields)
-		if len(fvs) > 0 {
-			fvals := make([]resp.Value, 0, len(fvs)*2)
+		nfields := o.Fields().Len()
+		if nfields > 0 {
+			fvals := make([]resp.Value, 0, nfields*2)
 			if msg.OutputType == JSON {
 				buf.WriteString(`,"fields":{`)
 			}
-			for i, fv := range fvs {
-				if msg.OutputType == JSON {
+			var i int
+			o.Fields().Scan(func(f field.Field) bool {
+				if json {
 					if i > 0 {
 						buf.WriteString(`,`)
 					}
-					buf.WriteString(jsonString(fv.field) + ":" + strconv.FormatFloat(fv.value, 'f', -1, 64))
+					buf.WriteString(jsonString(f.Name()) + ":" +
+						f.Value().JSON())
 				} else {
-					fvals = append(fvals, resp.StringValue(fv.field), resp.StringValue(strconv.FormatFloat(fv.value, 'f', -1, 64)))
+					fvals = append(fvals, resp.StringValue(f.Name()),
+						resp.StringValue(f.Value().Data()))
 				}
 				i++
-			}
-			if msg.OutputType == JSON {
+				return true
+			})
+			if json {
 				buf.WriteString(`}`)
 			} else {
 				vals = append(vals, resp.ArrayValue(fvals))
 			}
 		}
 	}
-	switch msg.OutputType {
-	case JSON:
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
-		return resp.StringValue(buf.String()), nil
-	case RESP:
-		var oval resp.Value
-		if withfields {
-			oval = resp.ArrayValue(vals)
-		} else {
-			oval = vals[0]
-		}
-		return oval, nil
+	if json {
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
+		return resp.StringValue(buf.String())
 	}
-	return NOMessage, nil
+	var oval resp.Value
+	if withfields {
+		oval = resp.ArrayValue(vals)
+	} else {
+		oval = vals[0]
+	}
+	return oval
 }
 
-func (server *Server) cmdDel(msg *Message) (res resp.Value, d commandDetails, err error) {
+// DEL key id [ERRON404]
+func (s *Server) cmdDEL(msg *Message) (resp.Value, commandDetails, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	var ok bool
-	if vs, d.key, ok = tokenval(vs); !ok || d.key == "" {
-		err = errInvalidNumberOfArguments
-		return
+
+	// >> Args
+
+	args := msg.Args
+	if len(args) < 3 {
+		return retwerr(errInvalidNumberOfArguments)
 	}
-	if vs, d.id, ok = tokenval(vs); !ok || d.id == "" {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	if len(vs) != 0 {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	found := false
-	col := server.getCol(d.key)
-	if col != nil {
-		d.obj, d.fields, ok = col.Delete(d.id)
-		if ok {
-			if col.Count() == 0 {
-				server.deleteCol(d.key)
-			}
-			found = true
+	key := args[1]
+	id := args[2]
+	erron404 := false
+	for i := 3; i < len(args); i++ {
+		switch strings.ToLower(args[i]) {
+		case "erron404":
+			erron404 = true
+		default:
+			return retwerr(errInvalidArgument(args[i]))
 		}
 	}
-	server.clearIDExpires(d.key, d.id)
+
+	// >> Operation
+
+	updated := false
+	var old *object.Object
+	col, _ := s.cols.Get(key)
+	if col != nil {
+		old = col.Delete(id)
+		if old != nil {
+			if col.Count() == 0 {
+				s.cols.Delete(key)
+			}
+			updated = true
+		} else if erron404 {
+			return retwerr(errIDNotFound)
+		}
+	} else if erron404 {
+		return retwerr(errKeyNotFound)
+	}
+	s.groupDisconnectObject(key, id)
+
+	// >> Response
+
+	var d commandDetails
+
 	d.command = "del"
-	d.updated = found
+	d.key = key
+	d.obj = old
+	d.updated = updated
 	d.timestamp = time.Now()
+
+	var res resp.Value
+
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` +
+			time.Since(start).String() + "\"}")
 	case RESP:
 		if d.updated {
 			res = resp.IntegerValue(1)
@@ -335,115 +367,116 @@ func (server *Server) cmdDel(msg *Message) (res resp.Value, d commandDetails, er
 			res = resp.IntegerValue(0)
 		}
 	}
-	return
+	return res, d, nil
 }
 
-func (server *Server) cmdPdel(msg *Message) (res resp.Value, d commandDetails, err error) {
+// PDEL key pattern
+func (s *Server) cmdPDEL(msg *Message) (resp.Value, commandDetails, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	var ok bool
-	if vs, d.key, ok = tokenval(vs); !ok || d.key == "" {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	if vs, d.pattern, ok = tokenval(vs); !ok || d.pattern == "" {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	if len(vs) != 0 {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	now := time.Now()
-	iter := func(id string, o geojson.Object, fields []float64) bool {
-		if match, _ := glob.Match(d.pattern, id); match {
-			d.children = append(d.children, &commandDetails{
-				command:   "del",
-				updated:   true,
-				timestamp: now,
-				key:       d.key,
-				id:        id,
-			})
-		}
-		return true
-	}
 
-	var expired int
-	col := server.getCol(d.key)
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 3 {
+		return retwerr(errInvalidNumberOfArguments)
+	}
+	key := args[1]
+	pattern := args[2]
+
+	// >> Operation
+
+	now := time.Now()
+	var children []*commandDetails
+	col, _ := s.cols.Get(key)
 	if col != nil {
-		g := glob.Parse(d.pattern, false)
+		g := glob.Parse(pattern, false)
+		var ids []string
+		iter := func(o *object.Object) bool {
+			if match, _ := glob.Match(pattern, o.ID()); match {
+				ids = append(ids, o.ID())
+			}
+			return true
+		}
 		if g.Limits[0] == "" && g.Limits[1] == "" {
 			col.Scan(false, nil, msg.Deadline, iter)
 		} else {
-			col.ScanRange(g.Limits[0], g.Limits[1], false, nil, msg.Deadline, iter)
+			col.ScanRange(g.Limits[0], g.Limits[1],
+				false, nil, msg.Deadline, iter)
 		}
-		var atLeastOneNotDeleted bool
-		for i, dc := range d.children {
-			dc.obj, dc.fields, ok = col.Delete(dc.id)
-			if !ok {
-				d.children[i].command = "?"
-				atLeastOneNotDeleted = true
-			} else {
-				d.children[i] = dc
-			}
-			server.clearIDExpires(d.key, dc.id)
-		}
-		if atLeastOneNotDeleted {
-			var nchildren []*commandDetails
-			for _, dc := range d.children {
-				if dc.command == "del" {
-					nchildren = append(nchildren, dc)
-				}
-			}
-			d.children = nchildren
+		for _, id := range ids {
+			obj := col.Delete(id)
+			children = append(children, &commandDetails{
+				command:   "del",
+				updated:   true,
+				timestamp: now,
+				key:       key,
+				obj:       obj,
+			})
+			s.groupDisconnectObject(key, id)
 		}
 		if col.Count() == 0 {
-			server.deleteCol(d.key)
+			s.cols.Delete(key)
 		}
 	}
+
+	// >> Response
+
+	var d commandDetails
+	var res resp.Value
+
 	d.command = "pdel"
+	d.children = children
+	d.key = key
+	d.pattern = pattern
 	d.updated = len(d.children) > 0
 	d.timestamp = now
 	d.parent = true
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` +
+			time.Since(start).String() + "\"}")
 	case RESP:
-		total := len(d.children) - expired
-		if total < 0 {
-			total = 0
-		}
-		res = resp.IntegerValue(total)
+		res = resp.IntegerValue(len(d.children))
 	}
-	return
+	return res, d, nil
 }
 
-func (server *Server) cmdDrop(msg *Message) (res resp.Value, d commandDetails, err error) {
-	start := time.Now()
-	vs := msg.Args[1:]
-	var ok bool
-	if vs, d.key, ok = tokenval(vs); !ok || d.key == "" {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	if len(vs) != 0 {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	col := server.getCol(d.key)
+func (s *Server) cmdDROPop(key string) *collection.Collection {
+	col, _ := s.cols.Get(key)
 	if col != nil {
-		server.deleteCol(d.key)
-		d.updated = true
-	} else {
-		d.key = "" // ignore the details
-		d.updated = false
+		s.cols.Delete(key)
 	}
+	s.groupDisconnectCollection(key)
+	return col
+}
+
+// DROP key
+func (s *Server) cmdDROP(msg *Message) (resp.Value, commandDetails, error) {
+	start := time.Now()
+
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 2 {
+		return retwerr(errInvalidNumberOfArguments)
+	}
+	key := args[1]
+
+	// >> Operation
+	col := s.cmdDROPop(key)
+
+	// >> Response
+
+	var res resp.Value
+	var d commandDetails
+	d.key = key
+	d.updated = col != nil
 	d.command = "drop"
 	d.timestamp = time.Now()
-	server.clearKeyExpires(d.key)
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` +
+			time.Since(start).String() + "\"}")
 	case RESP:
 		if d.updated {
 			res = resp.IntegerValue(1)
@@ -451,56 +484,76 @@ func (server *Server) cmdDrop(msg *Message) (res resp.Value, d commandDetails, e
 			res = resp.IntegerValue(0)
 		}
 	}
-	return
+	return res, d, nil
 }
 
-func (server *Server) cmdRename(msg *Message, nx bool) (res resp.Value, d commandDetails, err error) {
+// RENAME key newkey
+// RENAMENX key newkey
+func (s *Server) cmdRENAME(msg *Message) (resp.Value, commandDetails, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	var ok bool
-	if vs, d.key, ok = tokenval(vs); !ok || d.key == "" {
-		err = errInvalidNumberOfArguments
-		return
+
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 3 {
+		return retwerr(errInvalidNumberOfArguments)
 	}
-	if vs, d.newKey, ok = tokenval(vs); !ok || d.newKey == "" {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	if len(vs) != 0 {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	col := server.getCol(d.key)
+	nx := strings.ToLower(args[0]) == "renamenx"
+	key := args[1]
+	newKey := args[2]
+
+	// >> Operation
+
+	col, _ := s.cols.Get(key)
 	if col == nil {
-		err = errKeyNotFound
-		return
+		return retwerr(errKeyNotFound)
 	}
-	for _, h := range server.hooks {
-		if h.Key == d.key || h.Key == d.newKey {
-			err = errKeyHasHooksSet
-			return
+	var hasHook, hasChannel bool
+	s.hooks.Ascend(nil, func(v interface{}) bool {
+		h := v.(*Hook)
+		if h.Key == key || h.Key == newKey {
+			if h.channel {
+				hasChannel = true
+			} else {
+				hasHook = true
+			}
 		}
+		return true
+	})
+	if hasHook {
+		return retwerr(errKeyHasHooksSet)
 	}
-	d.command = "rename"
-	newCol := server.getCol(d.newKey)
+	if hasChannel {
+		return retwerr(errKeyHasChannelsSet)
+	}
+	var updated bool
+	newCol, _ := s.cols.Get(newKey)
 	if newCol == nil {
-		d.updated = true
-	} else if nx {
-		d.updated = false
-	} else {
-		server.deleteCol(d.newKey)
-		server.clearKeyExpires(d.newKey)
-		d.updated = true
+		updated = true
+	} else if !nx {
+		s.cols.Delete(newKey)
+		updated = true
 	}
-	if d.updated {
-		server.deleteCol(d.key)
-		server.setCol(d.newKey, col)
-		server.moveKeyExpires(d.key, d.newKey)
+	if updated {
+		s.cols.Delete(key)
+		s.cols.Set(newKey, col)
 	}
+
+	// >> Response
+
+	var d commandDetails
+	var res resp.Value
+
+	d.command = "rename"
+	d.key = key
+	d.newKey = newKey
+	d.updated = updated
 	d.timestamp = time.Now()
+
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` +
+			time.Since(start).String() + "\"}")
 	case RESP:
 		if !nx {
 			res = resp.SimpleStringValue("OK")
@@ -510,456 +563,607 @@ func (server *Server) cmdRename(msg *Message, nx bool) (res resp.Value, d comman
 			res = resp.IntegerValue(0)
 		}
 	}
-	return
+	return res, d, nil
 }
 
-func (server *Server) cmdFlushDB(msg *Message) (res resp.Value, d commandDetails, err error) {
+// FLUSHDB
+func (s *Server) cmdFLUSHDB(msg *Message) (resp.Value, commandDetails, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	if len(vs) != 0 {
-		err = errInvalidNumberOfArguments
-		return
+
+	// >> Args
+
+	args := msg.Args
+
+	if len(args) != 1 {
+		return retwerr(errInvalidNumberOfArguments)
 	}
-	server.cols = tinybtree.BTree{}
-	server.exlistmu.Lock()
-	server.exlist = nil
-	server.exlistmu.Unlock()
-	server.expires = make(map[string]map[string]time.Time)
-	server.hooks = make(map[string]*Hook)
-	server.hooksOut = make(map[string]*Hook)
-	server.hookTree = d2.BoxTree{}
+
+	// >> Operation
+
+	// clear the entire database
+
+	// drop each collection
+	keys := s.cols.Keys()
+	for _, key := range keys {
+		s.cmdDROPop(key)
+	}
+
+	// delete all channels
+	var names []string
+	s.hooks.Ascend(nil, func(item any) bool {
+		hook := item.(*Hook)
+		if hook.channel {
+			names = append(names, hook.Name)
+		}
+		return true
+	})
+	for _, name := range names {
+		s.cmdDELHOOKop(name, true)
+	}
+
+	// delete all hooks
+	names = names[:0]
+	s.hooks.Ascend(nil, func(item any) bool {
+		hook := item.(*Hook)
+		if !hook.channel {
+			names = append(names, hook.Name)
+		}
+		return true
+	})
+	for _, name := range names {
+		s.cmdDELHOOKop(name, false)
+	}
+
+	s.cols.Clear()
+	s.groupHooks.Clear()
+	s.groupObjects.Clear()
+	s.hookExpires.Clear()
+	s.hooks.Clear()
+	s.hooksOut.Clear()
+	s.hookTree.Clear()
+	s.hookCross.Clear()
+
+	// >> Response
+
+	var d commandDetails
 	d.command = "flushdb"
 	d.updated = true
 	d.timestamp = time.Now()
-	switch msg.OutputType {
-	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
-	case RESP:
+
+	var res resp.Value
+	if msg.OutputType == JSON {
+		res = resp.StringValue(`{"ok":true,"elapsed":"` +
+			time.Since(start).String() + "\"}")
+	} else {
 		res = resp.SimpleStringValue("OK")
 	}
-	return
+	return res, d, nil
 }
 
-func (server *Server) parseSetArgs(vs []string) (
-	d commandDetails, fields []string, values []float64,
-	xx, nx bool,
-	expires *float64, etype []byte, evs []string, err error,
-) {
-	var ok bool
-	var typ []byte
-	if vs, d.key, ok = tokenval(vs); !ok || d.key == "" {
-		err = errInvalidNumberOfArguments
-		return
+// SET key id [FIELD name value ...] [EX seconds] [NX|XX]
+// (OBJECT geojson)|(POINT lat lon z)|(BOUNDS minlat minlon maxlat maxlon)|
+// (HASH geohash)|(STRING value)
+func (s *Server) cmdSET(msg *Message) (resp.Value, commandDetails, error) {
+	start := time.Now()
+	if s.config.maxMemory() > 0 && s.outOfMemory.Load() {
+		return retwerr(errOOM)
 	}
-	if vs, d.id, ok = tokenval(vs); !ok || d.id == "" {
-		err = errInvalidNumberOfArguments
-		return
+
+	// >> Args
+
+	var key string
+	var id string
+	var fields []field.Field
+	var ex int64
+	var xx bool
+	var nx bool
+	var ret bool
+	var withfields bool
+	kind := "object"
+	var precision int64
+	var oobj geojson.Object
+
+	args := msg.Args
+	if len(args) < 3 {
+		return retwerr(errInvalidNumberOfArguments)
 	}
-	var arg []byte
-	var nvs []string
-	for {
-		if nvs, arg, ok = tokenvalbytes(vs); !ok || len(arg) == 0 {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		if lcb(arg, "field") {
-			vs = nvs
-			var name string
-			var svalue string
-			var value float64
-			if vs, name, ok = tokenval(vs); !ok || name == "" {
-				err = errInvalidNumberOfArguments
-				return
+
+	key, id = args[1], args[2]
+
+	for i := 3; i < len(args); i++ {
+		switch strings.ToLower(args[i]) {
+		case "field":
+			if i+2 >= len(args) {
+				return retwerr(errInvalidNumberOfArguments)
 			}
-			if isReservedFieldName(name) {
-				err = errInvalidArgument(name)
-				return
+			fkey := args[i+1]
+			fval := args[i+2]
+			i += 2
+			if isReservedFieldName(fkey) {
+				return retwerr(errInvalidArgument(fkey))
 			}
-			if vs, svalue, ok = tokenval(vs); !ok || svalue == "" {
-				err = errInvalidNumberOfArguments
-				return
+			fields = append(fields, field.Make(fkey, fval))
+		case "ex":
+			if i+1 >= len(args) {
+				return retwerr(errInvalidNumberOfArguments)
 			}
-			value, err = strconv.ParseFloat(svalue, 64)
+			exval := args[i+1]
+			i += 1
+			x, err := strconv.ParseFloat(exval, 64)
 			if err != nil {
-				err = errInvalidArgument(svalue)
-				return
+				return retwerr(errInvalidArgument(exval))
 			}
-			fields = append(fields, name)
-			values = append(values, value)
-			continue
-		}
-		if lcb(arg, "ex") {
-			vs = nvs
-			if expires != nil {
-				err = errInvalidArgument(string(arg))
-				return
-			}
-			var s string
-			var v float64
-			if vs, s, ok = tokenval(vs); !ok || s == "" {
-				err = errInvalidNumberOfArguments
-				return
-			}
-			v, err = strconv.ParseFloat(s, 64)
-			if err != nil {
-				err = errInvalidArgument(s)
-				return
-			}
-			expires = &v
-			continue
-		}
-		if lcb(arg, "xx") {
-			vs = nvs
-			if nx {
-				err = errInvalidArgument(string(arg))
-				return
-			}
-			xx = true
-			continue
-		}
-		if lcb(arg, "nx") {
-			vs = nvs
+			ex = time.Now().UnixNano() + int64(float64(time.Second)*x)
+		case "nx":
 			if xx {
-				err = errInvalidArgument(string(arg))
-				return
+				return retwerr(errInvalidArgument(args[i]))
 			}
 			nx = true
-			continue
-		}
-		break
-	}
-	if vs, typ, ok = tokenvalbytes(vs); !ok || len(typ) == 0 {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	if len(vs) == 0 {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	etype = typ
-	evs = vs
-	switch {
-	default:
-		err = errInvalidArgument(string(typ))
-		return
-	case lcb(typ, "string"):
-		var str string
-		if vs, str, ok = tokenval(vs); !ok {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		d.obj = collection.String(str)
-	case lcb(typ, "point"):
-		var slat, slon, sz string
-		if vs, slat, ok = tokenval(vs); !ok || slat == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		if vs, slon, ok = tokenval(vs); !ok || slon == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		vs, sz, ok = tokenval(vs)
-		if !ok || sz == "" {
-			var x, y float64
-			y, err = strconv.ParseFloat(slat, 64)
-			if err != nil {
-				err = errInvalidArgument(slat)
-				return
+		case "xx":
+			if nx {
+				return retwerr(errInvalidArgument(args[i]))
 			}
-			x, err = strconv.ParseFloat(slon, 64)
-			if err != nil {
-				err = errInvalidArgument(slon)
-				return
+			xx = true
+		case "return":
+			if ret {
+				return retwerr(errInvalidArgument(args[i]))
 			}
-			d.obj = geojson.NewPoint(geometry.Point{X: x, Y: y})
-		} else {
-			var x, y, z float64
-			y, err = strconv.ParseFloat(slat, 64)
-			if err != nil {
-				err = errInvalidArgument(slat)
-				return
-			}
-			x, err = strconv.ParseFloat(slon, 64)
-			if err != nil {
-				err = errInvalidArgument(slon)
-				return
-			}
-			z, err = strconv.ParseFloat(sz, 64)
-			if err != nil {
-				err = errInvalidArgument(sz)
-				return
-			}
-			d.obj = geojson.NewPointZ(geometry.Point{X: x, Y: y}, z)
-		}
-	case lcb(typ, "bounds"):
-		var sminlat, sminlon, smaxlat, smaxlon string
-		if vs, sminlat, ok = tokenval(vs); !ok || sminlat == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		if vs, sminlon, ok = tokenval(vs); !ok || sminlon == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		if vs, smaxlat, ok = tokenval(vs); !ok || smaxlat == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		if vs, smaxlon, ok = tokenval(vs); !ok || smaxlon == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		var minlat, minlon, maxlat, maxlon float64
-		minlat, err = strconv.ParseFloat(sminlat, 64)
-		if err != nil {
-			err = errInvalidArgument(sminlat)
-			return
-		}
-		minlon, err = strconv.ParseFloat(sminlon, 64)
-		if err != nil {
-			err = errInvalidArgument(sminlon)
-			return
-		}
-		maxlat, err = strconv.ParseFloat(smaxlat, 64)
-		if err != nil {
-			err = errInvalidArgument(smaxlat)
-			return
-		}
-		maxlon, err = strconv.ParseFloat(smaxlon, 64)
-		if err != nil {
-			err = errInvalidArgument(smaxlon)
-			return
-		}
-		d.obj = geojson.NewRect(geometry.Rect{
-			Min: geometry.Point{X: minlon, Y: minlat},
-			Max: geometry.Point{X: maxlon, Y: maxlat},
-		})
-	case lcb(typ, "hash"):
-		var shash string
-		if vs, shash, ok = tokenval(vs); !ok || shash == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		lat, lon := geohash.Decode(shash)
-		d.obj = geojson.NewPoint(geometry.Point{X: lon, Y: lat})
-	case lcb(typ, "object"):
-		var object string
-		if vs, object, ok = tokenval(vs); !ok || object == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		d.obj, err = geojson.Parse(object, &server.geomParseOpts)
-		if err != nil {
-			return
-		}
-	}
-	if len(vs) != 0 {
-		err = errInvalidNumberOfArguments
-	}
-	return
-}
+			ret = true
 
-func (server *Server) cmdSet(msg *Message) (res resp.Value, d commandDetails, err error) {
-	if server.config.maxMemory() > 0 && server.outOfMemory.on() {
-		err = errOOM
-		return
+			for j := i; j < i+3; j++ {
+				if j >= len(args) {
+					break
+				}
+				switch strings.ToLower(args[j]) {
+				case "withfields":
+					withfields = true
+					i += 1
+				case "object":
+					kind = "object"
+					i += 1
+				case "point":
+					kind = "point"
+					i += 1
+				case "bounds":
+					kind = "bounds"
+					i += 1
+				case "hash":
+					kind = "hash"
+					j++
+					if j == len(args) {
+						return retwerr(errInvalidNumberOfArguments)
+					}
+					var err error
+					precision, err = strconv.ParseInt(args[j], 10, 64)
+					if err != nil || precision < 1 || precision > 12 {
+						return retwerr(errInvalidArgument(args[j]))
+					}
+					i += 2
+				case "a5":
+					kind = "a5"
+					j++
+					if j == len(args) {
+						return retwerr(errInvalidNumberOfArguments)
+					}
+					var err error
+					precision, err = strconv.ParseInt(args[j], 10, 64)
+					if err != nil || !a5ValidResolution(int(precision)) {
+						return retwerr(errInvalidArgument(args[j]))
+					}
+					i += 2
+				}
+			}
+		case "string":
+			if i+1 >= len(args) {
+				return retwerr(errInvalidNumberOfArguments)
+			}
+			str := args[i+1]
+			i += 1
+			oobj = collection.String(str)
+		case "point":
+			if i+2 >= len(args) {
+				return retwerr(errInvalidNumberOfArguments)
+			}
+			slat := args[i+1]
+			slon := args[i+2]
+			i += 2
+			var z float64
+			var hasZ bool
+			if i+1 < len(args) {
+				// probe for possible z coordinate
+				var err error
+				z, err = strconv.ParseFloat(args[i+1], 64)
+				if err == nil {
+					hasZ = true
+					i++
+				}
+			}
+			y, err := strconv.ParseFloat(slat, 64)
+			if err != nil {
+				return retwerr(errInvalidArgument(slat))
+			}
+			x, err := strconv.ParseFloat(slon, 64)
+			if err != nil {
+				return retwerr(errInvalidArgument(slon))
+			}
+			if !hasZ {
+				oobj = geojson.NewPoint(geometry.Point{X: x, Y: y})
+			} else {
+				oobj = geojson.NewPointZ(geometry.Point{X: x, Y: y}, z)
+			}
+		case "bounds":
+			if i+4 >= len(args) {
+				return retwerr(errInvalidNumberOfArguments)
+			}
+			var vals [4]float64
+			for j := 0; j < 4; j++ {
+				var err error
+				vals[j], err = strconv.ParseFloat(args[i+1+j], 64)
+				if err != nil {
+					return retwerr(errInvalidArgument(args[i+1+j]))
+				}
+			}
+			i += 4
+			oobj = geojson.NewRect(geometry.Rect{
+				Min: geometry.Point{X: vals[1], Y: vals[0]},
+				Max: geometry.Point{X: vals[3], Y: vals[2]},
+			})
+		case "hash":
+			if i+1 >= len(args) {
+				return retwerr(errInvalidNumberOfArguments)
+			}
+			shash := args[i+1]
+			i += 1
+			lat, lon := geohash.Decode(shash)
+			oobj = geojson.NewPoint(geometry.Point{X: lon, Y: lat})
+		case "a5":
+			if i+1 >= len(args) {
+				return retwerr(errInvalidNumberOfArguments)
+			}
+			scell := args[i+1]
+			i += 1
+			cellID, err := a5DecodeCell(scell)
+			if err != nil {
+				return retwerr(errInvalidArgument(scell))
+			}
+			ll := a5.CellToLonLat(cellID)
+			oobj = geojson.NewPoint(geometry.Point{X: ll[0], Y: ll[1]})
+		case "object":
+			if i+1 >= len(args) {
+				return retwerr(errInvalidNumberOfArguments)
+			}
+			json := args[i+1]
+			i += 1
+			var err error
+			oobj, err = geojson.Parse(json, &s.geomParseOpts)
+			if err != nil {
+				return retwerr(err)
+			}
+		default:
+			return retwerr(errInvalidArgument(args[i]))
+		}
 	}
-	start := time.Now()
-	vs := msg.Args[1:]
-	var fmap map[string]int
-	var fields []string
-	var values []float64
-	var xx, nx bool
-	var ex *float64
-	d, fields, values, xx, nx, ex, _, _, err = server.parseSetArgs(vs)
-	if err != nil {
-		return
+	if oobj == nil {
+		return retwerr(errInvalidNumberOfArguments)
 	}
-	col := server.getCol(d.key)
-	if col == nil {
+
+	// >> Operation
+
+	nada := func() (resp.Value, commandDetails, error) {
+		// exclude operation due to 'xx' or 'nx' match
+		if msg.OutputType == JSON {
+			if nx {
+				return retwerr(errIDAlreadyExists)
+			} else {
+				return retwerr(errIDNotFound)
+			}
+		}
+		return resp.NullValue(), commandDetails{}, nil
+	}
+
+	col, ok := s.cols.Get(key)
+	if !ok {
 		if xx {
-			goto notok
+			return nada()
 		}
 		col = collection.New()
-		server.setCol(d.key, col)
+		s.cols.Set(key, col)
 	}
+
 	if xx || nx {
-		_, _, ok := col.Get(d.id)
-		if (nx && ok) || (xx && !ok) {
-			goto notok
+		if col.Get(id) == nil {
+			if xx {
+				return nada()
+			}
+		} else {
+			if nx {
+				return nada()
+			}
 		}
 	}
-	server.clearIDExpires(d.key, d.id)
-	d.oldObj, d.oldFields, d.fields = col.Set(d.id, d.obj, fields, values)
+
+	var flist field.List
+	if old := col.Get(id); old != nil {
+		flist = old.Fields()
+	}
+	for _, f := range fields {
+		flist = flist.Set(f)
+	}
+	obj := object.New(id, oobj, ex, flist)
+	old := col.Set(obj)
+
+	// >> Response
+
+	var d commandDetails
 	d.command = "set"
+	d.key = key
+	d.obj = obj
+	d.old = old
 	d.updated = true // perhaps we should do a diff on the previous object?
 	d.timestamp = time.Now()
-	if msg.ConnType != Null || msg.OutputType != Null {
-		// likely loaded from aof at server startup, ignore field remapping.
-		fmap = col.FieldMap()
-		d.fmap = make(map[string]int)
-		for key, idx := range fmap {
-			d.fmap[key] = idx
-		}
+
+	if ret {
+		res := buildObjectResponse(msg, obj, start, kind, precision, withfields, msg.OutputType == JSON)
+		return res, d, nil
 	}
-	if ex != nil {
-		server.expireAt(d.key, d.id, d.timestamp.Add(time.Duration(float64(time.Second)*(*ex))))
-	}
+
+	var res resp.Value
 	switch msg.OutputType {
 	default:
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		res = resp.SimpleStringValue("OK")
 	}
-	return
-notok:
-	switch msg.OutputType {
-	default:
-	case JSON:
-		if nx {
-			err = errIDAlreadyExists
-		} else {
-			err = errIDNotFound
-		}
-		return
-	case RESP:
-		res = resp.NullValue()
-	}
-	return
+	return res, d, nil
 }
 
-func (server *Server) parseFSetArgs(vs []string) (
-	d commandDetails, fields []string, values []float64, xx bool, err error,
-) {
-	var ok bool
-	if vs, d.key, ok = tokenval(vs); !ok || d.key == "" {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	if vs, d.id, ok = tokenval(vs); !ok || d.id == "" {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	for len(vs) > 0 {
-		var name string
-		if vs, name, ok = tokenval(vs); !ok || name == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		if lc(name, "xx") {
-			xx = true
-			continue
-		}
-		if isReservedFieldName(name) {
-			err = errInvalidArgument(name)
-			return
-		}
-		var svalue string
-		var value float64
-		if vs, svalue, ok = tokenval(vs); !ok || svalue == "" {
-			err = errInvalidNumberOfArguments
-			return
-		}
-		value, err = strconv.ParseFloat(svalue, 64)
-		if err != nil {
-			err = errInvalidArgument(svalue)
-			return
-		}
-		fields = append(fields, name)
-		values = append(values, value)
-	}
-	return
+func retwerr(err error) (resp.Value, commandDetails, error) {
+	return resp.Value{}, commandDetails{}, err
+}
+func retrerr(err error) (resp.Value, error) {
+	return resp.Value{}, err
 }
 
-func (server *Server) cmdFset(msg *Message) (res resp.Value, d commandDetails, err error) {
-	if server.config.maxMemory() > 0 && server.outOfMemory.on() {
-		err = errOOM
-		return
-	}
+// FSET key id [XX] field value [field value...]
+func (s *Server) cmdFSET(msg *Message) (resp.Value, commandDetails, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	var fields []string
-	var values []float64
-	var xx bool
-	var updateCount int
-	d, fields, values, xx, err = server.parseFSetArgs(vs)
+	if s.config.maxMemory() > 0 && s.outOfMemory.Load() {
+		return retwerr(errOOM)
+	}
 
-	col := server.getCol(d.key)
-	if col == nil {
-		err = errKeyNotFound
-		return
+	// >> Args
+
+	var id string
+	var key string
+	var xx bool
+	var ret bool
+	var withfields bool
+	kind := "object"
+	var precision int64
+
+	var fields []field.Field // raw fields
+
+	args := msg.Args
+	if len(args) < 5 {
+		return retwerr(errInvalidNumberOfArguments)
 	}
-	var ok bool
-	d.obj, d.fields, updateCount, ok = col.SetFields(d.id, fields, values)
+	key, id = args[1], args[2]
+	for i := 3; i < len(args); i++ {
+		arg := args[i]
+		switch strings.ToLower(arg) {
+		case "xx":
+			xx = true
+		case "return":
+			if ret {
+				return retwerr(errInvalidArgument(args[i]))
+			}
+			ret = true
+
+			for j := i; j < i+3; j++ {
+				if j >= len(args) {
+					break
+				}
+				switch strings.ToLower(args[j]) {
+				case "withfields":
+					withfields = true
+					i += 1
+				case "object":
+					kind = "object"
+					i += 1
+				case "point":
+					kind = "point"
+					i += 1
+				case "bounds":
+					kind = "bounds"
+					i += 1
+				case "hash":
+					kind = "hash"
+					j++
+					if j == len(args) {
+						return retwerr(errInvalidNumberOfArguments)
+					}
+					var err error
+					precision, err = strconv.ParseInt(args[j], 10, 64)
+					if err != nil || precision < 1 || precision > 12 {
+						return retwerr(errInvalidArgument(args[j]))
+					}
+					i += 2
+				case "a5":
+					kind = "a5"
+					j++
+					if j == len(args) {
+						return retwerr(errInvalidNumberOfArguments)
+					}
+					var err error
+					precision, err = strconv.ParseInt(args[j], 10, 64)
+					if err != nil || !a5ValidResolution(int(precision)) {
+						return retwerr(errInvalidArgument(args[j]))
+					}
+					i += 2
+				}
+			}
+
+		default:
+			fkey := arg
+			i++
+			if i == len(args) {
+				return retwerr(errInvalidNumberOfArguments)
+			}
+			if isReservedFieldName(fkey) {
+				return retwerr(errInvalidArgument(fkey))
+			}
+			fval := args[i]
+			fields = append(fields, field.Make(fkey, fval))
+		}
+	}
+
+	// >> Operation
+
+	var d commandDetails
+	var updateCount int
+
+	col, ok := s.cols.Get(key)
+	if !ok {
+		return retwerr(errKeyNotFound)
+	}
+	o := col.Get(id)
+	ok = o != nil
 	if !(ok || xx) {
-		err = errIDNotFound
-		return
+		return retwerr(errIDNotFound)
 	}
+
 	if ok {
+		ofields := o.Fields()
+		for _, f := range fields {
+			prev := ofields.Get(f.Name())
+			if !prev.Value().Equals(f.Value()) {
+				ofields = ofields.Set(f)
+				updateCount++
+			}
+		}
+		obj := object.New(id, o.Geo(), o.Expires(), ofields)
+		col.Set(obj)
 		d.command = "fset"
+		d.key = key
+		d.obj = obj
 		d.timestamp = time.Now()
 		d.updated = updateCount > 0
-		fmap := col.FieldMap()
-		d.fmap = make(map[string]int)
-		for key, idx := range fmap {
-			d.fmap[key] = idx
-		}
+	}
+
+	// >> Response
+
+	var res resp.Value
+
+	if ret {
+		res := buildObjectResponse(msg, d.obj, start, kind, precision, withfields, msg.OutputType == JSON)
+		return res, d, nil
 	}
 
 	switch msg.OutputType {
 	case JSON:
-		res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"elapsed":"` +
+			time.Since(start).String() + "\"}")
 	case RESP:
 		res = resp.IntegerValue(updateCount)
 	}
-	return
+
+	return res, d, nil
 }
 
-func (server *Server) cmdExpire(msg *Message) (res resp.Value, d commandDetails, err error) {
+// FGET key id field
+func (s *Server) cmdFGET(msg *Message) (resp.Value, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	var key, id, svalue string
-	var ok bool
-	if vs, key, ok = tokenval(vs); !ok || key == "" {
-		err = errInvalidNumberOfArguments
-		return
+
+	// >> Args
+
+	args := msg.Args
+
+	if len(args) < 4 {
+		return retrerr(errInvalidNumberOfArguments)
 	}
-	if vs, id, ok = tokenval(vs); !ok || id == "" {
-		err = errInvalidNumberOfArguments
-		return
+	key, id, field := args[1], args[2], args[3]
+
+	// >> Operation
+
+	col, _ := s.cols.Get(key)
+	if col == nil {
+		return retrerr(errKeyNotFound)
 	}
-	if vs, svalue, ok = tokenval(vs); !ok || svalue == "" {
-		err = errInvalidNumberOfArguments
-		return
+	o := col.Get(id)
+	if o == nil {
+		return retrerr(errIDNotFound)
 	}
-	if len(vs) != 0 {
-		err = errInvalidNumberOfArguments
-		return
+	f := o.Fields().Get(field)
+
+	// >> Response
+
+	var buf bytes.Buffer
+	switch msg.OutputType {
+	case JSON:
+		buf.WriteString(`{"ok":true`)
+		buf.WriteString(`,"value":` + f.Value().JSON())
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
+		return resp.StringValue(buf.String()), nil
+	case RESP:
+		return resp.StringValue(f.Value().Data()), nil
 	}
-	var value float64
-	value, err = strconv.ParseFloat(svalue, 64)
+	return NOMessage, nil
+}
+
+// EXPIRE key id seconds
+func (s *Server) cmdEXPIRE(msg *Message) (resp.Value, commandDetails, error) {
+	start := time.Now()
+
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 4 {
+		return retwerr(errInvalidNumberOfArguments)
+	}
+	key, id, svalue := args[1], args[2], args[3]
+	value, err := strconv.ParseFloat(svalue, 64)
 	if err != nil {
-		err = errInvalidArgument(svalue)
-		return
+		return retwerr(errInvalidArgument(svalue))
 	}
-	ok = false
-	col := server.getCol(key)
+
+	// >> Operation
+
+	var ok bool
+	var obj *object.Object
+	col, _ := s.cols.Get(key)
 	if col != nil {
-		_, _, ok = col.Get(id)
-		ok = ok && !server.hasExpired(key, id)
+		// replace the expiration by getting the old object
+		ex := time.Now().Add(
+			time.Duration(float64(time.Second) * value)).UnixNano()
+		o := col.Get(id)
+		ok = o != nil
+		if ok {
+			obj = object.New(id, o.Geo(), ex, o.Fields())
+			col.Set(obj)
+		}
 	}
+
+	// >> Response
+
+	var d commandDetails
 	if ok {
-		server.expireAt(key, id, time.Now().Add(time.Duration(float64(time.Second)*value)))
+		d.key = key
+		d.obj = obj
+		d.command = "expire"
 		d.updated = true
+		d.timestamp = time.Now()
 	}
+	var res resp.Value
 	switch msg.OutputType {
 	case JSON:
 		if ok {
-			res = resp.StringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+			res = resp.StringValue(`{"ok":true,"elapsed":"` +
+				time.Since(start).String() + "\"}")
+		} else if col == nil {
+			return retwerr(errKeyNotFound)
 		} else {
-			return resp.SimpleStringValue(""), d, errIDNotFound
+			return retwerr(errIDNotFound)
 		}
 	case RESP:
 		if ok {
@@ -968,48 +1172,61 @@ func (server *Server) cmdExpire(msg *Message) (res resp.Value, d commandDetails,
 			res = resp.IntegerValue(0)
 		}
 	}
-	return
+	return res, d, nil
 }
 
-func (server *Server) cmdPersist(msg *Message) (res resp.Value, d commandDetails, err error) {
+// PERSIST key id
+func (s *Server) cmdPERSIST(msg *Message) (resp.Value, commandDetails, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	var key, id string
-	var ok bool
-	if vs, key, ok = tokenval(vs); !ok || key == "" {
-		err = errInvalidNumberOfArguments
-		return
+
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 3 {
+		return retwerr(errInvalidNumberOfArguments)
 	}
-	if vs, id, ok = tokenval(vs); !ok || id == "" {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	if len(vs) != 0 {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	var cleared bool
-	ok = false
-	col := server.getCol(key)
-	if col != nil {
-		_, _, ok = col.Get(id)
-		ok = ok && !server.hasExpired(key, id)
-		if ok {
-			cleared = server.clearIDExpires(key, id)
-		}
-	}
-	if !ok {
+	key, id := args[1], args[2]
+
+	// >> Operation
+
+	col, _ := s.cols.Get(key)
+	if col == nil {
 		if msg.OutputType == RESP {
-			return resp.IntegerValue(0), d, nil
+			return resp.IntegerValue(0), commandDetails{}, nil
 		}
-		return resp.SimpleStringValue(""), d, errIDNotFound
+		return retwerr(errKeyNotFound)
 	}
+	o := col.Get(id)
+	if o == nil {
+		if msg.OutputType == RESP {
+			return resp.IntegerValue(0), commandDetails{}, nil
+		}
+		return retwerr(errIDNotFound)
+	}
+
+	var obj *object.Object
+	var cleared bool
+	if o.Expires() != 0 {
+		obj = object.New(id, o.Geo(), 0, o.Fields())
+		col.Set(obj)
+		cleared = true
+	}
+
+	// >> Response
+
+	var res resp.Value
+
+	var d commandDetails
 	d.command = "persist"
+	d.key = key
+	d.obj = obj
 	d.updated = cleared
 	d.timestamp = time.Now()
+
 	switch msg.OutputType {
 	case JSON:
-		res = resp.SimpleStringValue(`{"ok":true,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.SimpleStringValue(`{"ok":true,"elapsed":"` +
+			time.Since(start).String() + "\"}")
 	case RESP:
 		if cleared {
 			res = resp.IntegerValue(1)
@@ -1017,72 +1234,122 @@ func (server *Server) cmdPersist(msg *Message) (res resp.Value, d commandDetails
 			res = resp.IntegerValue(0)
 		}
 	}
-	return
+	return res, d, nil
 }
 
-func (server *Server) cmdTTL(msg *Message) (res resp.Value, err error) {
+// TTL key id
+func (s *Server) cmdTTL(msg *Message) (resp.Value, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	var key, id string
-	var ok bool
-	if vs, key, ok = tokenval(vs); !ok || key == "" {
-		err = errInvalidNumberOfArguments
-		return
+
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 3 {
+		return retrerr(errInvalidNumberOfArguments)
 	}
-	if vs, id, ok = tokenval(vs); !ok || id == "" {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	if len(vs) != 0 {
-		err = errInvalidNumberOfArguments
-		return
-	}
-	var v float64
-	ok = false
-	var ok2 bool
-	col := server.getCol(key)
-	if col != nil {
-		_, _, ok = col.Get(id)
-		ok = ok && !server.hasExpired(key, id)
-		if ok {
-			var at time.Time
-			at, ok2 = server.getExpires(key, id)
-			if ok2 {
-				if time.Now().After(at) {
-					ok2 = false
-				} else {
-					v = float64(at.Sub(time.Now())) / float64(time.Second)
-					if v < 0 {
-						v = 0
-					}
-				}
-			}
+	key, id := args[1], args[2]
+
+	// >> Operation
+
+	col, _ := s.cols.Get(key)
+	if col == nil {
+		if msg.OutputType == JSON {
+			return retrerr(errKeyNotFound)
 		}
+		return resp.IntegerValue(-2), nil
 	}
-	switch msg.OutputType {
-	case JSON:
-		if ok {
-			var ttl string
-			if ok2 {
-				ttl = strconv.FormatFloat(v, 'f', -1, 64)
-			} else {
-				ttl = "-1"
-			}
-			res = resp.SimpleStringValue(
-				`{"ok":true,"ttl":` + ttl + `,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
-		} else {
-			return resp.SimpleStringValue(""), errIDNotFound
+
+	o := col.Get(id)
+	if o == nil {
+		if msg.OutputType == JSON {
+			return retrerr(errIDNotFound)
 		}
-	case RESP:
-		if ok {
-			if ok2 {
-				res = resp.IntegerValue(int(v))
-			} else {
-				res = resp.IntegerValue(-1)
-			}
-		} else {
-			res = resp.IntegerValue(-2)
-		}
+		return resp.IntegerValue(-2), nil
 	}
-	return
+
+	var ttl float64
+	if o.Expires() == 0 {
+		ttl = -1
+	} else {
+		now := start.UnixNano()
+		ttl = math.Max(float64(o.Expires()-now)/float64(time.Second), 0)
+	}
+
+	// >> Response
+
+	if msg.OutputType == JSON {
+		return resp.SimpleStringValue(
+			`{"ok":true,"ttl":` + strconv.Itoa(int(ttl)) + `,"elapsed":"` +
+				time.Since(start).String() + "\"}"), nil
+	}
+	return resp.IntegerValue(int(ttl)), nil
+}
+
+// EXISTS key id
+func (s *Server) cmdEXISTS(msg *Message) (resp.Value, error) {
+	start := time.Now()
+
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 3 {
+		return retrerr(errInvalidNumberOfArguments)
+	}
+	key, id := args[1], args[2]
+
+	// >> Operation
+
+	col, _ := s.cols.Get(key)
+	if col == nil {
+		return retrerr(errKeyNotFound)
+	}
+
+	o := col.Get(id)
+	exists := o != nil
+
+	// >> Response
+
+	if msg.OutputType == JSON {
+		return resp.SimpleStringValue(
+			`{"ok":true,"exists":` + strconv.FormatBool(exists) + `,"elapsed":"` +
+				time.Since(start).String() + "\"}"), nil
+	}
+	return resp.BoolValue(exists), nil
+}
+
+// FEXISTS key id field
+func (s *Server) cmdFEXISTS(msg *Message) (resp.Value, error) {
+	start := time.Now()
+
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 4 {
+		return retrerr(errInvalidNumberOfArguments)
+	}
+	key, id, field := args[1], args[2], args[3]
+
+	// >> Operation
+
+	col, _ := s.cols.Get(key)
+	if col == nil {
+		return retrerr(errKeyNotFound)
+	}
+
+	o := col.Get(id)
+	if o == nil {
+		return retrerr(errIDNotFound)
+	}
+
+	f := o.Fields().Get(field)
+	exists := f.Name() != ""
+
+	// >> Response
+
+	if msg.OutputType == JSON {
+		return resp.SimpleStringValue(
+			`{"ok":true,"exists":` + strconv.FormatBool(exists) + `,"elapsed":"` +
+				time.Since(start).String() + "\"}"), nil
+	}
+	return resp.BoolValue(exists), nil
 }

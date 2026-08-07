@@ -2,13 +2,12 @@ package tests
 
 import (
 	"errors"
-	"testing"
 
 	"github.com/tidwall/gjson"
 )
 
-func subTestInfo(t *testing.T, mc *mockServer) {
-	runStep(t, mc, "valid json", info_valid_json_test)
+func subTestInfo(g *testGroup) {
+	g.regSubTest("valid json", info_valid_json_test)
 }
 
 func info_valid_json_test(mc *mockServer) error {

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/streadway/amqp"
@@ -35,8 +36,14 @@ const (
 	AMQP = Protocol("amqp")
 	// SQS protocol
 	SQS = Protocol("sqs")
+	// Google Cloud Pubsub protocol
+	PubSub = Protocol("pubsub")
 	// NATS protocol
 	NATS = Protocol("nats")
+	// EventHub protocol
+	EventHub = Protocol("sb")
+	// CFQueue protocol
+	CFQueue = Protocol("cf-queue")
 )
 
 // Endpoint represents an endpoint.
@@ -61,9 +68,15 @@ type Endpoint struct {
 		Channel string
 	}
 	Kafka struct {
-		Host      string
-		Port      int
-		TopicName string
+		Brokers    []string
+		TopicName  string
+		Auth       string
+		SSL        bool
+		SASLSHA256 bool
+		SASLSHA512 bool
+		CACertFile string
+		CertFile   string
+		KeyFile    string
 	}
 	AMQP struct {
 		URI          string
@@ -78,6 +91,7 @@ type Endpoint struct {
 		Mandatory    bool
 		Immediate    bool
 		DeliveryMode uint8
+		Priority     uint8
 	}
 	MQTT struct {
 		Host       string
@@ -88,6 +102,14 @@ type Endpoint struct {
 		CACertFile string
 		CertFile   string
 		KeyFile    string
+		SSL        bool
+		User       string
+		Pass       string
+	}
+	PubSub struct {
+		Project  string
+		Topic    string
+		CredPath string
 	}
 	SQS struct {
 		PlainURL    string
@@ -99,11 +121,27 @@ type Endpoint struct {
 		CreateQueue bool
 	}
 	NATS struct {
-		Host  string
-		Port  int
-		User  string
-		Pass  string
-		Topic string
+		Host    string
+		Port    int
+		User    string
+		Pass    string
+		Topic   string
+		Token   string
+		TLS     bool
+		TLSCert string
+		TLSKey  string
+		Secure  bool
+		// Jetstream indicates publishing via jetstream acknowledgements.
+		Jetstream          bool
+		UserCredentialPath string
+	}
+	EventHub struct {
+		ConnectionString string
+	}
+	CFQueue struct {
+		AccountID string
+		QueueID   string
+		APIToken  string
 	}
 	Local struct {
 		Channel string
@@ -112,6 +150,7 @@ type Endpoint struct {
 
 // Conn is an endpoint connection
 type Conn interface {
+	ExpireNow()
 	Expired() bool
 	Send(val string) error
 }
@@ -121,6 +160,8 @@ type Manager struct {
 	mu        sync.RWMutex
 	conns     map[string]Conn
 	publisher LocalPublisher
+	shutdown  atomic.Bool    // atomic bool
+	wg        sync.WaitGroup // run wait group
 }
 
 // NewManager returns a new manager
@@ -129,13 +170,29 @@ func NewManager(publisher LocalPublisher) *Manager {
 		conns:     make(map[string]Conn),
 		publisher: publisher,
 	}
-	go epc.Run()
+	epc.wg.Add(1)
+	go epc.run()
 	return epc
 }
 
+func (epc *Manager) Shutdown() {
+	defer epc.wg.Wait()
+	epc.shutdown.Store(true)
+	// expire the connections
+	epc.mu.Lock()
+	defer epc.mu.Unlock()
+	for _, conn := range epc.conns {
+		conn.ExpireNow()
+	}
+}
+
 // Run starts the managing of endpoints
-func (epc *Manager) Run() {
+func (epc *Manager) run() {
+	defer epc.wg.Done()
 	for {
+		if epc.shutdown.Load() {
+			return
+		}
 		time.Sleep(time.Second)
 		func() {
 			epc.mu.Lock()
@@ -183,12 +240,18 @@ func (epc *Manager) Send(endpoint, msg string) error {
 				conn = newMQTTConn(ep)
 			case AMQP:
 				conn = newAMQPConn(ep)
+			case PubSub:
+				conn = newPubSubConn(ep)
 			case SQS:
 				conn = newSQSConn(ep)
 			case NATS:
 				conn = newNATSConn(ep)
 			case Local:
 				conn = newLocalConn(ep, epc.publisher)
+			case EventHub:
+				conn = newEventHubConn(ep)
+			case CFQueue:
+				conn = newCFQueueConn(ep)
 			}
 			epc.conns[endpoint] = conn
 		}
@@ -238,10 +301,18 @@ func parseEndpoint(s string) (Endpoint, error) {
 		endpoint.Protocol = AMQP
 	case strings.HasPrefix(s, "mqtt:"):
 		endpoint.Protocol = MQTT
+	case strings.HasPrefix(s, "mqtts:"):
+		endpoint.Protocol = MQTT
+	case strings.HasPrefix(s, "pubsub:"):
+		endpoint.Protocol = PubSub
 	case strings.HasPrefix(s, "sqs:"):
 		endpoint.Protocol = SQS
 	case strings.HasPrefix(s, "nats:"):
 		endpoint.Protocol = NATS
+	case strings.HasPrefix(s, "Endpoint="):
+		endpoint.Protocol = EventHub
+	case strings.HasPrefix(s, "cf-queue:"):
+		endpoint.Protocol = CFQueue
 	}
 
 	s = s[strings.Index(s, ":")+1:]
@@ -357,21 +428,24 @@ func parseEndpoint(s string) (Endpoint, error) {
 
 	if endpoint.Protocol == Kafka {
 		// Parsing connection from URL string
-		hp := strings.Split(s, ":")
-		switch len(hp) {
-		default:
-			return endpoint, errors.New("invalid kafka url")
-		case 1:
-			endpoint.Kafka.Host = hp[0]
-			endpoint.Kafka.Port = 9092
-		case 2:
-			n, err := strconv.ParseUint(hp[1], 10, 16)
-			if err != nil {
-				return endpoint, errors.New("invalid kafka url port")
+		for _, broker := range strings.Split(s, ",") {
+			broker = strings.TrimSpace(broker)
+			if broker == "" {
+				return endpoint, errors.New("invalid kafka url")
 			}
-
-			endpoint.Kafka.Host = hp[0]
-			endpoint.Kafka.Port = int(n)
+			hp := strings.Split(broker, ":")
+			switch len(hp) {
+			default:
+				return endpoint, errors.New("invalid kafka url")
+			case 1:
+				endpoint.Kafka.Brokers = append(endpoint.Kafka.Brokers, hp[0]+":9092")
+			case 2:
+				_, err := strconv.ParseUint(hp[1], 10, 16)
+				if err != nil {
+					return endpoint, errors.New("invalid kafka url port")
+				}
+				endpoint.Kafka.Brokers = append(endpoint.Kafka.Brokers, broker)
+			}
 		}
 
 		// Parsing Kafka queue name
@@ -386,6 +460,35 @@ func parseEndpoint(s string) (Endpoint, error) {
 		// Throw error if we not provide any queue name
 		if endpoint.Kafka.TopicName == "" {
 			return endpoint, errors.New("missing kafka topic name")
+		}
+
+		// Parsing additional params
+		if len(sqp) > 1 {
+			m, err := url.ParseQuery(sqp[1])
+			if err != nil {
+				return endpoint, errors.New("invalid kafka url")
+			}
+			for key, val := range m {
+				if len(val) == 0 {
+					continue
+				}
+				switch key {
+				case "auth":
+					endpoint.Kafka.Auth = val[0]
+				case "ssl":
+					endpoint.Kafka.SSL, _ = strconv.ParseBool(val[0])
+				case "cacert":
+					endpoint.Kafka.CACertFile = val[0]
+				case "cert":
+					endpoint.Kafka.CertFile = val[0]
+				case "key":
+					endpoint.Kafka.KeyFile = val[0]
+				case "sha256":
+					endpoint.Kafka.SASLSHA256, _ = strconv.ParseBool(val[0])
+				case "sha512":
+					endpoint.Kafka.SASLSHA512, _ = strconv.ParseBool(val[0])
+				}
+			}
 		}
 	}
 
@@ -458,8 +561,16 @@ func parseEndpoint(s string) (Endpoint, error) {
 					endpoint.MQTT.CertFile = val[0]
 				case "key":
 					endpoint.MQTT.KeyFile = val[0]
+				case "user":
+					endpoint.MQTT.User = val[0]
+				case "pass":
+					endpoint.MQTT.Pass = val[0]
 				}
 			}
+		}
+
+		if strings.HasPrefix(endpoint.Original, "mqtts:") {
+			endpoint.MQTT.SSL = true
 		}
 
 		// Throw error if we not provide any queue name
@@ -524,6 +635,37 @@ func parseEndpoint(s string) (Endpoint, error) {
 				}
 			}
 		}
+	}
+	// Basic Pubsub connection strings in HOOKS interface
+	// pubsub://<project_name>:<topic_name>?params=value
+	//
+	//  params are:
+	//
+	// credpath - path where gcp credentials are located
+	if endpoint.Protocol == PubSub {
+		split := strings.Split(s, ":")
+		if len(split) != 2 {
+			return endpoint, errors.New("invalid PubSub format should be project/topic")
+		}
+		endpoint.PubSub.Project = split[0]
+		endpoint.PubSub.Topic = split[1]
+
+		if len(sqp) > 1 {
+			m, err := url.ParseQuery(sqp[1])
+			if err != nil {
+				return endpoint, errors.New("invalid Pubsub url")
+			}
+			for key, val := range m {
+				if len(val) == 0 {
+					continue
+				}
+				switch key {
+				case "credpath":
+					endpoint.PubSub.CredPath = val[0]
+				}
+			}
+		}
+
 	}
 
 	// Basic AMQP connection strings in HOOKS interface
@@ -591,6 +733,8 @@ func parseEndpoint(s string) (Endpoint, error) {
 					endpoint.AMQP.Mandatory = queryBool(val[0])
 				case "delivery_mode":
 					endpoint.AMQP.DeliveryMode = uint8(queryInt(val[0]))
+				case "priority":
+					endpoint.AMQP.Priority = uint8(queryInt(val[0]))
 				}
 			}
 		}
@@ -656,8 +800,88 @@ func parseEndpoint(s string) (Endpoint, error) {
 					endpoint.NATS.User = val[0]
 				case "pass":
 					endpoint.NATS.Pass = val[0]
+				case "token":
+					endpoint.NATS.Token = val[0]
+				case "secure":
+					endpoint.NATS.Secure = queryBool(val[0])
+				case "credential":
+					endpoint.NATS.UserCredentialPath = val[0]
+				case "jetstream":
+					endpoint.NATS.Jetstream = queryBool(val[0])
+				case "tls":
+					endpoint.NATS.TLS = queryBool(val[0])
+				case "tlscert":
+					endpoint.NATS.TLSCert = val[0]
+				case "tlskey":
+					endpoint.NATS.TLSKey = val[0]
 				}
 			}
+		}
+	}
+
+	if endpoint.Protocol == EventHub {
+		dp := strings.Split(endpoint.Original, ";")
+		if len(dp) != 4 {
+			return endpoint, errors.New("malformed EventHub connection string")
+		}
+
+		sakn := strings.Split(dp[1], "=")
+		if sakn[0] != "SharedAccessKeyName" {
+			return endpoint, errors.New("missing SharedAccessKeyName")
+		}
+
+		sak := strings.Split(dp[2], "=")
+		if sak[0] != "SharedAccessKey" {
+			return endpoint, errors.New("missing SharedAccessKey")
+		}
+
+		ep := strings.Split(dp[3], "=")
+		if ep[0] != "EntityPath" {
+			return endpoint, errors.New("missing EntityPath")
+		}
+
+		endpoint.EventHub.ConnectionString = endpoint.Original
+	}
+
+	// Basic CF Queue connection strings in HOOKS interface
+	// cf-queue://<account_id>/<queue_id>?token=<api_token>
+	//
+	//  params are:
+	//
+	// token - API token
+	if endpoint.Protocol == CFQueue {
+		// Parse account_id/queue_id from the path parts
+		if len(sp) < 2 {
+			return endpoint, errors.New("invalid CF Queue format, should be account_id/queue_id")
+		}
+		endpoint.CFQueue.AccountID = sp[0]
+		endpoint.CFQueue.QueueID = sp[1]
+
+		// Parse query parameters for API token
+		if len(sqp) > 1 {
+			m, err := url.ParseQuery(sqp[1])
+			if err != nil {
+				return endpoint, errors.New("invalid CF Queue url")
+			}
+			for key, val := range m {
+				if len(val) == 0 {
+					continue
+				}
+				switch key {
+				case "token":
+					endpoint.CFQueue.APIToken = val[0]
+				}
+			}
+		}
+
+		if endpoint.CFQueue.AccountID == "" {
+			return endpoint, errors.New("missing CF Queue account ID")
+		}
+		if endpoint.CFQueue.QueueID == "" {
+			return endpoint, errors.New("missing CF Queue queue ID")
+		}
+		if endpoint.CFQueue.APIToken == "" {
+			return endpoint, errors.New("missing CF Queue API token")
 		}
 	}
 

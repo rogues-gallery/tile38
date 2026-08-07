@@ -7,7 +7,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/yuin/gopher-lua"
+	"github.com/tidwall/tile38/internal/field"
+	"github.com/tidwall/tile38/internal/log"
+	lua "github.com/yuin/gopher-lua"
+	luajson "layeh.com/gopher-json"
 )
 
 const defaultSearchOutput = outputObjects
@@ -18,6 +21,8 @@ var errIDNotFound = errors.New("id not found")
 var errIDAlreadyExists = errors.New("id already exists")
 var errPathNotFound = errors.New("path not found")
 var errKeyHasHooksSet = errors.New("key has hooks set")
+var errKeyHasChannelsSet = errors.New("key has channels set")
+var errNotRectangle = errors.New("not a rectangle")
 
 func errInvalidArgument(arg string) error {
 	return fmt.Errorf("invalid argument '%s'", arg)
@@ -43,60 +48,6 @@ func tokenval(vs []string) (nvs []string, token string, ok bool) {
 	return
 }
 
-func tokenvalbytes(vs []string) (nvs []string, token []byte, ok bool) {
-	if len(vs) > 0 {
-		token = []byte(vs[0])
-		nvs = vs[1:]
-		ok = true
-	}
-	return
-}
-
-func tokenlc(line string) (newLine, token string) {
-	for i := 0; i < len(line); i++ {
-		ch := line[i]
-		if ch == ' ' {
-			return line[i+1:], line[:i]
-		}
-		if ch >= 'A' && ch <= 'Z' {
-			lc := make([]byte, 0, 16)
-			if i > 0 {
-				lc = append(lc, []byte(line[:i])...)
-			}
-			lc = append(lc, ch+32)
-			i++
-			for ; i < len(line); i++ {
-				ch = line[i]
-				if ch == ' ' {
-					return line[i+1:], string(lc)
-				}
-				if ch >= 'A' && ch <= 'Z' {
-					lc = append(lc, ch+32)
-				} else {
-					lc = append(lc, ch)
-				}
-			}
-			return "", string(lc)
-		}
-	}
-	return "", line
-}
-func lcb(s1 []byte, s2 string) bool {
-	if len(s1) != len(s2) {
-		return false
-	}
-	for i := 0; i < len(s1); i++ {
-		ch := s1[i]
-		if ch >= 'A' && ch <= 'Z' {
-			if ch+32 != s2[i] {
-				return false
-			}
-		} else if ch != s2[i] {
-			return false
-		}
-	}
-	return true
-}
 func lc(s1, s2 string) bool {
 	if len(s1) != len(s2) {
 		return false
@@ -115,56 +66,68 @@ func lc(s1, s2 string) bool {
 }
 
 type whereT struct {
-	field string
-	minx  bool
-	min   float64
-	maxx  bool
-	max   float64
+	expr bool
+	name string
+	minx bool
+	min  field.Value
+	maxx bool
+	max  field.Value
 }
 
-func (where whereT) match(value float64) bool {
+func mLT(a, b field.Value) bool  { return a.Less(b) }
+func mLTE(a, b field.Value) bool { return !mLT(b, a) }
+func mGT(a, b field.Value) bool  { return mLT(b, a) }
+func mGTE(a, b field.Value) bool { return !mLT(a, b) }
+func mEQ(a, b field.Value) bool  { return a.Equals(b) }
+
+func (where whereT) matchField(value field.Value) bool {
+	switch where.min.Data() {
+	case "<":
+		return mLT(value, where.max)
+	case "<=":
+		return mLTE(value, where.max)
+	case ">":
+		return mGT(value, where.max)
+	case ">=":
+		return mGTE(value, where.max)
+	case "==":
+		return mEQ(value, where.max)
+	case "!=":
+		return !mEQ(value, where.max)
+	}
 	if !where.minx {
-		if value < where.min {
+		if mLT(value, where.min) { // if value < where.min {
 			return false
 		}
 	} else {
-		if value <= where.min {
+		if mLTE(value, where.min) { // if value <= where.min {
 			return false
 		}
 	}
 	if !where.maxx {
-		if value > where.max {
+		if mGT(value, where.max) { // if value > where.max {
 			return false
 		}
 	} else {
-		if value >= where.max {
+		if mGTE(value, where.max) { // if value >= where.max {
 			return false
 		}
 	}
 	return true
 }
 
-func zMinMaxFromWheres(wheres []whereT) (minZ, maxZ float64) {
-	for _, w := range wheres {
-		if w.field == "z" {
-			minZ = w.min
-			maxZ = w.max
-			return
+type whereinT struct {
+	name   string
+	valArr []field.Value
+}
+
+func (wherein whereinT) match(value field.Value) bool {
+	for _, val := range wherein.valArr {
+		if mEQ(val, value) {
+			return true
 		}
 	}
-	minZ = math.Inf(-1)
-	maxZ = math.Inf(+1)
-	return
-}
-
-type whereinT struct {
-	field  string
-	valMap map[float64]struct{}
-}
-
-func (wherein whereinT) match(value float64) bool {
-	_, ok := wherein.valMap[value]
-	return ok
+	return false
 }
 
 type whereevalT struct {
@@ -181,48 +144,88 @@ func (whereeval whereevalT) Close() {
 	whereeval.c.luapool.Put(whereeval.luaState)
 }
 
-func (whereeval whereevalT) match(fieldsWithNames map[string]float64) bool {
-	fieldsTbl := whereeval.luaState.CreateTable(0, len(fieldsWithNames))
-	for field, val := range fieldsWithNames {
-		fieldsTbl.RawSetString(field, lua.LNumber(val))
+func luaSetField(tbl *lua.LTable, name string, val field.Value) {
+	var lval lua.LValue
+	switch val.Kind() {
+	case field.Null:
+		lval = lua.LNil
+	case field.False:
+		lval = lua.LFalse
+	case field.True:
+		lval = lua.LTrue
+	case field.Number:
+		lval = lua.LNumber(val.Num())
+	default:
+		lval = lua.LString(val.Data())
 	}
+	tbl.RawSetString(name, lval)
+}
 
+func (whereeval whereevalT) match(fieldsWithNames map[string]field.Value,
+	id string, props string) (ok bool, err error,
+) {
+	fieldsTbl := whereeval.luaState.CreateTable(0, len(fieldsWithNames))
+	for name, val := range fieldsWithNames {
+		luaSetField(fieldsTbl, name, val)
+	}
+	propsTbl := lua.LValue(whereeval.luaState.CreateTable(0, 0))
+	if props != "" {
+		var err error
+		tbl, err := luajson.Decode(whereeval.luaState, []byte(props))
+		if err == nil {
+			propsTbl = tbl
+		}
+	}
 	luaSetRawGlobals(
 		whereeval.luaState, map[string]lua.LValue{
-			"FIELDS": fieldsTbl,
+			"ID":         lua.LString(id),
+			"FIELDS":     fieldsTbl,
+			"PROPERTIES": propsTbl,
 		})
-	defer luaSetRawGlobals(
-		whereeval.luaState, map[string]lua.LValue{
-			"FIELDS": lua.LNil,
-		})
+	defer func() {
+		luaSetRawGlobals(
+			whereeval.luaState, map[string]lua.LValue{
+				"ID":         lua.LNil,
+				"FIELDS":     lua.LNil,
+				"PROPERTIES": lua.LNil,
+			})
+	}()
 
 	whereeval.luaState.Push(whereeval.fn)
 	if err := whereeval.luaState.PCall(0, 1, nil); err != nil {
-		panic(err.Error())
+		emsg := err.Error()
+		if strings.Contains(emsg, "attempt to index a non-table") {
+			log.Debugf("Lua error: %v", emsg)
+			return false, nil
+		}
+		return false, err
 	}
 	ret := whereeval.luaState.Get(-1)
 	whereeval.luaState.Pop(1)
 
+	if ret == nil {
+		return false, nil
+	}
 	// Make bool out of returned lua value
 	switch ret.Type() {
 	case lua.LTNil:
-		return false
+		return false, nil
 	case lua.LTBool:
-		return ret == lua.LTrue
+		return ret == lua.LTrue, nil
 	case lua.LTNumber:
-		return float64(ret.(lua.LNumber)) != 0
+		return float64(ret.(lua.LNumber)) != 0, nil
 	case lua.LTString:
-		return ret.String() != ""
+		return ret.String() != "", nil
 	case lua.LTTable:
 		tbl := ret.(*lua.LTable)
 		if tbl.Len() != 0 {
-			return true
+			return true, nil
 		}
 		var match bool
 		tbl.ForEach(func(lk lua.LValue, lv lua.LValue) { match = true })
-		return match
+		return match, nil
 	}
-	panic(fmt.Sprintf("Script returned value of type %s", ret.Type()))
+	return false, fmt.Errorf("script returned value of type %s", ret.Type())
 }
 
 type searchScanBaseTokens struct {
@@ -230,13 +233,12 @@ type searchScanBaseTokens struct {
 	cursor     uint64
 	output     outputT
 	precision  uint64
-	lineout    string
 	fence      bool
 	distance   bool
 	nodwell    bool
 	detect     map[string]bool
 	accept     map[string]bool
-	glob       string
+	globs      []string
 	wheres     []whereT
 	whereins   []whereinT
 	whereevals []whereevalT
@@ -247,9 +249,15 @@ type searchScanBaseTokens struct {
 	sparse     uint8
 	desc       bool
 	clip       bool
+	buffer     float64
+	hasbuffer  bool
+	mvt        bool
+	tileX      int
+	tileY      int
+	tileZ      int
 }
 
-func (c *Server) parseSearchScanBaseTokens(
+func (s *Server) parseSearchScanBaseTokens(
 	cmd string, t searchScanBaseTokens, vs []string,
 ) (
 	vsout []string, tout searchScanBaseTokens, err error,
@@ -270,6 +278,22 @@ func (c *Server) parseSearchScanBaseTokens(
 		nvs, wtok, ok := tokenval(vs)
 		if ok && len(wtok) > 0 {
 			switch strings.ToLower(wtok) {
+			case "buffer":
+				vs = nvs
+				var sbuf string
+				if vs, sbuf, ok = tokenval(vs); !ok || sbuf == "" {
+					err = errInvalidNumberOfArguments
+					return
+				}
+				var buf float64
+				buf, err = strconv.ParseFloat(sbuf, 64)
+				if err != nil || buf < 0 || math.IsInf(buf, 0) || math.IsNaN(buf) {
+					err = errInvalidArgument(sbuf)
+					return
+				}
+				t.buffer = buf
+				t.hasbuffer = true
+				continue
 			case "cursor":
 				vs = nvs
 				if scursor != "" {
@@ -283,57 +307,67 @@ func (c *Server) parseSearchScanBaseTokens(
 				continue
 			case "where":
 				vs = nvs
-				var field, smin, smax string
-				if vs, field, ok = tokenval(vs); !ok || field == "" {
-					err = errInvalidNumberOfArguments
-					return
-				}
-				if vs, smin, ok = tokenval(vs); !ok || smin == "" {
-					err = errInvalidNumberOfArguments
-					return
-				}
-				if vs, smax, ok = tokenval(vs); !ok || smax == "" {
-					err = errInvalidNumberOfArguments
-					return
-				}
-				var minx, maxx bool
-				var min, max float64
-				if strings.ToLower(smin) == "-inf" {
-					min = math.Inf(-1)
-				} else {
-					if strings.HasPrefix(smin, "(") {
-						minx = true
-						smin = smin[1:]
-					}
-					min, err = strconv.ParseFloat(smin, 64)
-					if err != nil {
-						err = errInvalidArgument(smin)
+				if detectExprToken(vs) {
+					// using expressions
+					// WHERE expr
+					var expr string
+					if vs, expr, ok = tokenval(vs); !ok {
+						err = errInvalidNumberOfArguments
 						return
 					}
-				}
-				if strings.ToLower(smax) == "+inf" {
-					max = math.Inf(+1)
+					t.wheres = append(t.wheres, whereT{name: expr, expr: true})
+					continue
 				} else {
-					if strings.HasPrefix(smax, "(") {
-						maxx = true
-						smax = smax[1:]
-					}
-					max, err = strconv.ParseFloat(smax, 64)
-					if err != nil {
-						err = errInvalidArgument(smax)
+					// using field filter
+					// WHERE min max
+					var name, smin, smax string
+					if vs, name, ok = tokenval(vs); !ok {
+						err = errInvalidNumberOfArguments
 						return
 					}
+					if vs, smin, ok = tokenval(vs); !ok {
+						err = errInvalidNumberOfArguments
+						return
+					}
+					if vs, smax, ok = tokenval(vs); !ok {
+						err = errInvalidNumberOfArguments
+						return
+					}
+					var minx, maxx bool
+					smin = strings.ToLower(smin)
+					smax = strings.ToLower(smax)
+					if smax == "+inf" || smax == "inf" {
+						smax = "inf"
+					}
+					switch smin {
+					case "<", "<=", ">", ">=", "==", "!=":
+					default:
+						if strings.HasPrefix(smin, "(") {
+							minx = true
+							smin = smin[1:]
+						}
+						if strings.HasPrefix(smax, "(") {
+							maxx = true
+							smax = smax[1:]
+						}
+					}
+					t.wheres = append(t.wheres, whereT{
+						name: name,
+						minx: minx,
+						min:  field.ValueOf(smin),
+						maxx: maxx,
+						max:  field.ValueOf(smax),
+					})
+					continue
 				}
-				t.wheres = append(t.wheres, whereT{field, minx, min, maxx, max})
-				continue
 			case "wherein":
 				vs = nvs
-				var field, nvalsStr, valStr string
-				if vs, field, ok = tokenval(vs); !ok || field == "" {
+				var name, nvalsStr, valStr string
+				if vs, name, ok = tokenval(vs); !ok {
 					err = errInvalidNumberOfArguments
 					return
 				}
-				if vs, nvalsStr, ok = tokenval(vs); !ok || nvalsStr == "" {
+				if vs, nvalsStr, ok = tokenval(vs); !ok {
 					err = errInvalidNumberOfArguments
 					return
 				}
@@ -342,21 +376,18 @@ func (c *Server) parseSearchScanBaseTokens(
 					err = errInvalidArgument(nvalsStr)
 					return
 				}
-				valMap := make(map[float64]struct{})
-				var val float64
-				var empty struct{}
+				valArr := make([]field.Value, nvals)
 				for i = 0; i < nvals; i++ {
-					if vs, valStr, ok = tokenval(vs); !ok || valStr == "" {
+					if vs, valStr, ok = tokenval(vs); !ok {
 						err = errInvalidNumberOfArguments
 						return
 					}
-					if val, err = strconv.ParseFloat(valStr, 64); err != nil {
-						err = errInvalidArgument(valStr)
-						return
-					}
-					valMap[val] = empty
+					valArr[i] = field.ValueOf(valStr)
 				}
-				t.whereins = append(t.whereins, whereinT{field, valMap})
+				t.whereins = append(t.whereins, whereinT{
+					name:   name,
+					valArr: valArr,
+				})
 				continue
 			case "whereevalsha":
 				fallthrough
@@ -380,7 +411,7 @@ func (c *Server) parseSearchScanBaseTokens(
 				}
 
 				var luaState *lua.LState
-				luaState, err = c.luapool.Get()
+				luaState, err = s.luapool.Get()
 				if err != nil {
 					return
 				}
@@ -406,7 +437,7 @@ func (c *Server) parseSearchScanBaseTokens(
 						"ARGV": argsTbl,
 					})
 
-				compiled, ok := c.luascripts.Get(shaSum)
+				compiled, ok := s.luascripts.Get(shaSum)
 				var fn *lua.LFunction
 				if ok {
 					fn = &lua.LFunction{
@@ -426,9 +457,11 @@ func (c *Server) parseSearchScanBaseTokens(
 						err = makeSafeErr(err)
 						return
 					}
-					c.luascripts.Put(shaSum, fn.Proto)
+					s.luascripts.PutLRU(shaSum, fn.Proto)
 				}
-				t.whereevals = append(t.whereevals, whereevalT{c, luaState, fn})
+				t.whereevals = append(t.whereevals, whereevalT{
+					c: s, luaState: luaState, fn: fn,
+				})
 				continue
 			case "nofields":
 				vs = nvs
@@ -562,14 +595,12 @@ func (c *Server) parseSearchScanBaseTokens(
 				continue
 			case "match":
 				vs = nvs
-				if t.glob != "" {
-					err = errDuplicateArgument(strings.ToUpper(wtok))
-					return
-				}
-				if vs, t.glob, ok = tokenval(vs); !ok || t.glob == "" {
+				var glob string
+				if vs, glob, ok = tokenval(vs); !ok || glob == "" {
 					err = errInvalidNumberOfArguments
 					return
 				}
+				t.globs = append(t.globs, glob)
 				continue
 			case "clip":
 				vs = nvs
@@ -646,6 +677,12 @@ func (c *Server) parseSearchScanBaseTokens(
 				err = errInvalidNumberOfArguments
 				return
 			}
+		case "a5":
+			t.output = outputA5
+			if nvs, sprecision, ok = tokenval(nvs); !ok || sprecision == "" {
+				err = errInvalidNumberOfArguments
+				return
+			}
 		case "bounds":
 			t.output = outputBounds
 		case "ids":
@@ -662,9 +699,24 @@ func (c *Server) parseSearchScanBaseTokens(
 		}
 	}
 	if sprecision != "" {
-		if t.precision, err = strconv.ParseUint(sprecision, 10, 64); err != nil || t.precision == 0 || t.precision > 64 {
+		t.precision, err = strconv.ParseUint(sprecision, 10, 64)
+		if err != nil {
 			err = errInvalidArgument(sprecision)
 			return
+		}
+		switch t.output {
+		case outputA5:
+			// A5 resolutions range from 0 (whole-world faces) to 30.
+			if t.precision > a5MaxResolution {
+				err = errInvalidArgument(sprecision)
+				return
+			}
+		default:
+			// geohash precision ranges from 1 to 12.
+			if t.precision == 0 || t.precision > 12 {
+				err = errInvalidArgument(sprecision)
+				return
+			}
 		}
 	}
 	if slimit != "" {
@@ -677,7 +729,8 @@ func (c *Server) parseSearchScanBaseTokens(
 	if ssparse != "" {
 		t.usparse = true
 		var sparse uint64
-		if sparse, err = strconv.ParseUint(ssparse, 10, 8); err != nil || sparse == 0 || sparse > 8 {
+		if sparse, err = strconv.ParseUint(ssparse, 10, 8); err != nil ||
+			sparse == 0 || sparse > 16 {
 			err = errInvalidArgument(ssparse)
 			return
 		}
@@ -686,5 +739,159 @@ func (c *Server) parseSearchScanBaseTokens(
 	}
 	vsout = vs
 	tout = t
+	return
+}
+
+func detectExprToken(vs []string) bool {
+	// Detect the kind of where, either:
+	// - expr
+	// - name min max
+	if len(vs) == 0 {
+		return false
+	} else if len(vs) == 1 || (len(vs) == 2 && len(vs[1]) == 0) {
+		return true
+	}
+	v := vs[1]
+	if (v[0] >= 'a' && v[0] <= 'z') || (v[0] >= 'A' && v[0] <= 'Z') {
+		if (v[0] == 'i' || v[0] == 'I') && strings.ToLower(v) == "inf" {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+type parentStack []*areaExpression
+
+func (ps *parentStack) isEmpty() bool {
+	return len(*ps) == 0
+}
+
+func (ps *parentStack) push(e *areaExpression) {
+	*ps = append(*ps, e)
+}
+
+func (ps *parentStack) pop() (e *areaExpression, empty bool) {
+	n := len(*ps)
+	if n == 0 {
+		return nil, true
+	}
+	x := (*ps)[n-1]
+	*ps = (*ps)[:n-1]
+	return x, false
+}
+
+func (s *Server) parseAreaExpression(vsin []string, doClip bool) (vsout []string, ae *areaExpression, err error) {
+	ps := &parentStack{}
+	vsout = vsin[:]
+	var negate, needObj bool
+loop:
+	for {
+		nvs, wtok, ok := tokenval(vsout)
+		if !ok || len(wtok) == 0 {
+			break
+		}
+		switch strings.ToLower(wtok) {
+		case tokenLParen:
+			newExpr := &areaExpression{negate: negate, op: NOOP}
+			negate = false
+			needObj = false
+			if ae != nil {
+				ae.children = append(ae.children, newExpr)
+			}
+			ae = newExpr
+			ps.push(ae)
+			vsout = nvs
+		case tokenRParen:
+			if needObj {
+				err = errInvalidArgument(tokenRParen)
+				return
+			}
+			parent, empty := ps.pop()
+			if empty {
+				err = errInvalidArgument(tokenRParen)
+				return
+			}
+			ae = parent
+			vsout = nvs
+		case tokenNOT:
+			negate = !negate
+			needObj = true
+			vsout = nvs
+		case tokenAND:
+			if needObj {
+				err = errInvalidArgument(tokenAND)
+				return
+			}
+			needObj = true
+			if ae == nil {
+				err = errInvalidArgument(tokenAND)
+				return
+			} else if ae.obj == nil {
+				switch ae.op {
+				case OR:
+					numChildren := len(ae.children)
+					if numChildren < 2 {
+						err = errInvalidNumberOfArguments
+						return
+					}
+					ae.children = append(
+						ae.children[:numChildren-1],
+						&areaExpression{
+							op:       AND,
+							children: []*areaExpression{ae.children[numChildren-1]}})
+				case NOOP:
+					ae.op = AND
+				}
+			} else {
+				ae = &areaExpression{op: AND, children: []*areaExpression{ae}}
+			}
+			vsout = nvs
+		case tokenOR:
+			if needObj {
+				err = errInvalidArgument(tokenOR)
+				return
+			}
+			needObj = true
+			if ae == nil {
+				err = errInvalidArgument(tokenOR)
+				return
+			} else if ae.obj == nil {
+				switch ae.op {
+				case AND:
+					if len(ae.children) < 2 {
+						err = errInvalidNumberOfArguments
+						return
+					}
+					ae = &areaExpression{op: OR, children: []*areaExpression{ae}}
+				case NOOP:
+					ae.op = OR
+				}
+			} else {
+				ae = &areaExpression{op: OR, children: []*areaExpression{ae}}
+			}
+			vsout = nvs
+		case "point", "circle", "object", "bounds", "hash", "quadkey", "tile", "get", "sector":
+			parsedVs, parsedObj, areaErr := s.parseArea(vsout, doClip)
+			if areaErr != nil {
+				err = areaErr
+				return
+			}
+			newExpr := &areaExpression{negate: negate, obj: parsedObj, op: NOOP}
+			negate = false
+			needObj = false
+			if ae == nil {
+				ae = newExpr
+			} else {
+				ae.children = append(ae.children, newExpr)
+			}
+			vsout = parsedVs
+		default:
+			break loop
+		}
+	}
+	if !ps.isEmpty() || needObj || ae == nil || (ae.obj == nil && len(ae.children) == 0) {
+		err = errInvalidNumberOfArguments
+	}
 	return
 }

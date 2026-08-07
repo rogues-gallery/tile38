@@ -4,15 +4,18 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
+	"math/rand"
+	"os"
 	"sync"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/tidwall/tile38/internal/log"
 )
 
 const (
-	mqttExpiresAfter = time.Second * 30
+	mqttExpiresAfter   = time.Second * 30
+	mqttPublishTimeout = time.Second * 5
 )
 
 // MQTTConn is an endpoint connection
@@ -29,7 +32,7 @@ func (conn *MQTTConn) Expired() bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	if !conn.ex {
-		if time.Now().Sub(conn.t) > mqttExpiresAfter {
+		if time.Since(conn.t) > mqttExpiresAfter {
 			conn.close()
 			conn.ex = true
 		}
@@ -37,12 +40,19 @@ func (conn *MQTTConn) Expired() bool {
 	return conn.ex
 }
 
+// ExpireNow forces the connection to expire
+func (conn *MQTTConn) ExpireNow() {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	conn.close()
+	conn.ex = true
+}
+
 func (conn *MQTTConn) close() {
 	if conn.conn != nil {
 		if conn.conn.IsConnected() {
 			conn.conn.Disconnect(250)
 		}
-
 		conn.conn = nil
 	}
 }
@@ -58,7 +68,12 @@ func (conn *MQTTConn) Send(msg string) error {
 	conn.t = time.Now()
 
 	if conn.conn == nil {
-		uri := fmt.Sprintf("tcp://%s:%d", conn.ep.MQTT.Host, conn.ep.MQTT.Port)
+		prefix := "tcp://"
+		if conn.ep.MQTT.SSL {
+			prefix = "ssl://"
+		}
+
+		uri := fmt.Sprintf("%s%s:%d", prefix, conn.ep.MQTT.Host, conn.ep.MQTT.Port)
 		ops := paho.NewClientOptions()
 		if conn.ep.MQTT.CertFile != "" || conn.ep.MQTT.KeyFile != "" ||
 			conn.ep.MQTT.CACertFile != "" {
@@ -73,7 +88,7 @@ func (conn *MQTTConn) Send(msg string) error {
 			}
 			if conn.ep.MQTT.CACertFile != "" {
 				// Load CA cert
-				caCert, err := ioutil.ReadFile(conn.ep.MQTT.CACertFile)
+				caCert, err := os.ReadFile(conn.ep.MQTT.CACertFile)
 				if err != nil {
 					return err
 				}
@@ -83,10 +98,27 @@ func (conn *MQTTConn) Send(msg string) error {
 			}
 			ops = ops.SetTLSConfig(&config)
 		}
-		ops = ops.SetClientID("tile38").AddBroker(uri)
+		//generate UUID for the client-id.
+		b := make([]byte, 16)
+		_, err := rand.Read(b)
+		if err != nil {
+			log.Debugf("Failed to generate guid for the mqtt client. The endpoint will not work")
+			return err
+		}
+		uuid := fmt.Sprintf("tile38-%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+		ops = ops.SetClientID(uuid).AddBroker(uri)
+
+		if conn.ep.MQTT.User != "" {
+			ops = ops.SetUsername(conn.ep.MQTT.User)
+		}
+		if conn.ep.MQTT.Pass != "" {
+			ops = ops.SetPassword(conn.ep.MQTT.Pass)
+		}
+
 		c := paho.NewClient(ops)
 
 		if token := c.Connect(); token.Wait() && token.Error() != nil {
+			log.Debugf("Failed to connect mqtt with error: %v", token.Error())
 			return token.Error()
 		}
 
@@ -95,9 +127,9 @@ func (conn *MQTTConn) Send(msg string) error {
 
 	t := conn.conn.Publish(conn.ep.MQTT.QueueName, conn.ep.MQTT.Qos,
 		conn.ep.MQTT.Retained, msg)
-	t.Wait()
 
-	if t.Error() != nil {
+	if !t.WaitTimeout(mqttPublishTimeout) || t.Error() != nil {
+		log.Debugf("Failed to publish mqtt message with error: %v", t.Error())
 		conn.close()
 		return t.Error()
 	}

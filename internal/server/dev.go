@@ -19,7 +19,7 @@ func randMassInsertPosition(minLat, minLon, maxLat, maxLon float64) (float64, fl
 	return lat, lon
 }
 
-func (c *Server) cmdMassInsert(msg *Message) (res resp.Value, err error) {
+func (s *Server) cmdMassInsert(msg *Message) (res resp.Value, err error) {
 	start := time.Now()
 	vs := msg.Args[1:]
 
@@ -74,23 +74,23 @@ func (c *Server) cmdMassInsert(msg *Message) (res resp.Value, err error) {
 	if err != nil {
 		return NOMessage, errInvalidArgument(snumPoints)
 	}
+
 	docmd := func(args []string) error {
-		var nmsg Message
-		nmsg = *msg
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		nmsg := *msg
 		nmsg._command = ""
 		nmsg.Args = args
-		var d commandDetails
-		_, d, err = c.command(&nmsg, nil)
+		_, d, err := s.command(&nmsg, nil)
 		if err != nil {
 			return err
 		}
-
-		return c.writeAOF(nmsg.Args, &d)
+		return s.writeAOF(nmsg.Args, &d)
 
 	}
 	rand.Seed(time.Now().UnixNano())
 	objs = int(n)
-	var k uint64
+	var k atomic.Uint64
 	for i := 0; i < cols; i++ {
 		key := "mi:" + strconv.FormatInt(int64(i), 10)
 		func(key string) {
@@ -119,6 +119,10 @@ func (c *Server) cmdMassInsert(msg *Message) (res resp.Value, err error) {
 						fmt.Sprintf("fname:%d", i),
 						strconv.FormatFloat(fval, 'f', -1, 64))
 				}
+				if rand.Int()%2 == 0 {
+					values = append(values, "EX", fmt.Sprint(rand.Intn(25)+5))
+				}
+
 				if j%8 == 0 {
 					values = append(values, "STRING", fmt.Sprintf("str%v", j))
 				} else {
@@ -128,22 +132,23 @@ func (c *Server) cmdMassInsert(msg *Message) (res resp.Value, err error) {
 						strconv.FormatFloat(lon, 'f', -1, 64),
 					)
 				}
-				if err := docmd(values); err != nil {
+				err := docmd(values)
+				if err != nil {
 					log.Fatal(err)
 					return
 				}
-				atomic.AddUint64(&k, 1)
+				k.Add(1)
 				if j%1000 == 1000-1 {
-					log.Infof("massinsert: %s %d/%d", key, atomic.LoadUint64(&k), cols*objs)
+					log.Debugf("massinsert: %s %d/%d", key, k.Load(), cols*objs)
 				}
 			}
 		}(key)
 	}
-	log.Infof("massinsert: done %d objects", atomic.LoadUint64(&k))
+	log.Infof("massinsert: done %d objects", k.Load())
 	return OKMessage(msg, start), nil
 }
 
-func (c *Server) cmdSleep(msg *Message) (res resp.Value, err error) {
+func (s *Server) cmdSleep(msg *Message) (res resp.Value, err error) {
 	start := time.Now()
 	if len(msg.Args) != 2 {
 		return NOMessage, errInvalidNumberOfArguments

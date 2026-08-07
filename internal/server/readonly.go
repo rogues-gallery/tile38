@@ -1,44 +1,50 @@
 package server
 
 import (
-	"strings"
 	"time"
 
 	"github.com/tidwall/resp"
 	"github.com/tidwall/tile38/internal/log"
 )
 
-func (c *Server) cmdReadOnly(msg *Message) (res resp.Value, err error) {
+// READONLY yes|no
+func (s *Server) cmdREADONLY(msg *Message) (resp.Value, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	var arg string
-	var ok bool
 
-	if vs, arg, ok = tokenval(vs); !ok || arg == "" {
-		return NOMessage, errInvalidNumberOfArguments
+	// >> Args
+
+	args := msg.Args
+	if len(args) != 2 {
+		return retrerr(errInvalidNumberOfArguments)
 	}
-	if len(vs) != 0 {
-		return NOMessage, errInvalidNumberOfArguments
-	}
-	update := false
-	switch strings.ToLower(arg) {
+
+	switch args[1] {
+	case "yes", "no":
 	default:
-		return NOMessage, errInvalidArgument(arg)
-	case "yes":
-		if !c.config.readOnly() {
-			update = true
-			c.config.setReadOnly(true)
+		return retrerr(errInvalidArgument(args[1]))
+	}
+
+	// >> Operation
+
+	var updated bool
+	if args[1] == "yes" {
+		if !s.config.readOnly() {
+			updated = true
+			s.config.setReadOnly(true)
 			log.Info("read only")
 		}
-	case "no":
-		if c.config.readOnly() {
-			update = true
-			c.config.setReadOnly(false)
+	} else {
+		if s.config.readOnly() {
+			updated = true
+			s.config.setReadOnly(false)
 			log.Info("read write")
 		}
 	}
-	if update {
-		c.config.write(false)
+	if updated {
+		s.config.write(false)
 	}
+
+	// >> Response
+
 	return OKMessage(msg, start), nil
 }

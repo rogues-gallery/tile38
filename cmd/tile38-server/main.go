@@ -4,12 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
@@ -17,27 +17,14 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/tile38/core"
 	"github.com/tidwall/tile38/internal/hservice"
 	"github.com/tidwall/tile38/internal/log"
 	"github.com/tidwall/tile38/internal/server"
+
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-)
-
-var (
-	dir         string
-	port        int
-	host        string
-	verbose     bool
-	veryVerbose bool
-	devMode     bool
-	quiet       bool
-	pidfile     string
-	cpuprofile  string
-	memprofile  string
-	pprofport   int
-	nohup       bool
 )
 
 // TODO: Set to false in 2.*
@@ -81,7 +68,7 @@ func main() {
 	output := os.Stderr
 	flag.Usage = func() {
 		fmt.Fprintf(output,
-			versionLine+`
+			"%s", versionLine+`
 
 Usage: tile38-server [-p port]
 
@@ -89,6 +76,9 @@ Basic Options:
   -h hostname : listening host
   -p port     : listening port (default: 9851)
   -d path     : data directory (default: data)
+  -s socket   : listen on unix socket file
+  -l encoding : set log encoding to json or text (default: text) 
+  -o output   : auto set client output to json or resp (default: resp) 
   -q          : no logging. totally silent output
   -v          : enable verbose logging
   -vv         : enable very verbose logging
@@ -100,8 +90,8 @@ Advanced Options:
   --queuefilename path    : Event queue path (default:data/queue.db)
   --http-transport yes/no : HTTP transport (default: yes)
   --protected-mode yes/no : protected mode (default: yes)
-  --threads num           : number of network threads (default: num cores)
-  --nohup                 : do not exist on SIGHUP
+  --nohup                 : do not exit on SIGHUP
+  --spinlock              : use a spinlock. For very write-heavy workloads
 
 Developer Options:
   --dev                             : enable developer mode
@@ -119,7 +109,7 @@ Developer Options:
 			log.Fatal(err)
 		}
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			data, err := ioutil.ReadAll(r.Body)
+			data, err := io.ReadAll(r.Body)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -152,7 +142,37 @@ Developer Options:
 		return
 	}
 
-	var showEvioDisabled bool
+	var (
+		nohup               bool
+		showEvioDisabled    bool
+		showThreadsDisabled bool
+		spinlock            bool
+	)
+
+	var (
+		// use to be in core/options.go
+
+		// DevMode puts application in to dev mode
+		devMode = false
+
+		// ShowDebugMessages allows for log.Debug to print to console.
+		showDebugMessages = false
+
+		// ProtectedMode forces Tile38 to default in protected mode.
+		protectedMode = "no"
+
+		// AppendOnly allows for disabling the appendonly file.
+		appendOnly = true
+
+		// AppendFileName allows for custom appendonly file path
+		appendFileName = ""
+
+		// QueueFileName allows for custom queue.db file path
+		queueFileName = ""
+
+		// ClientOutput for auto assigning the output for client.
+		clientOutput = ""
+	)
 
 	// parse non standard args.
 	nargs := []string{os.Args[0]}
@@ -170,10 +190,10 @@ Developer Options:
 			if i < len(os.Args) {
 				switch strings.ToLower(os.Args[i]) {
 				case "no":
-					core.ProtectedMode = "no"
+					protectedMode = "no"
 					continue
 				case "yes":
-					core.ProtectedMode = "yes"
+					protectedMode = "yes"
 					continue
 				}
 			}
@@ -185,15 +205,18 @@ Developer Options:
 		case "--nohup", "-nohup":
 			nohup = true
 			continue
+		case "--spinlock", "-spinlock":
+			spinlock = true
+			continue
 		case "--appendonly", "-appendonly":
 			i++
 			if i < len(os.Args) {
 				switch strings.ToLower(os.Args[i]) {
 				case "no":
-					core.AppendOnly = false
+					appendOnly = false
 					continue
 				case "yes":
-					core.AppendOnly = true
+					appendOnly = true
 					continue
 				}
 			}
@@ -205,14 +228,25 @@ Developer Options:
 				fmt.Fprintf(os.Stderr, "appendfilename must have a value\n")
 				os.Exit(1)
 			}
-			core.AppendFileName = os.Args[i]
+			appendFileName = os.Args[i]
 		case "--queuefilename", "-queuefilename":
 			i++
 			if i == len(os.Args) || os.Args[i] == "" {
 				fmt.Fprintf(os.Stderr, "queuefilename must have a value\n")
 				os.Exit(1)
 			}
-			core.QueueFileName = os.Args[i]
+			queueFileName = os.Args[i]
+		case "-o":
+			i++
+			if i < len(os.Args) {
+				switch strings.ToLower(os.Args[i]) {
+				case "resp", "json":
+					clientOutput = strings.ToLower(os.Args[i])
+					continue
+				}
+			}
+			fmt.Fprintf(os.Stderr, "output must be 'resp' or 'json'\n")
+			os.Exit(1)
 		case "--http-transport", "-http-transport":
 			i++
 			if i < len(os.Args) {
@@ -230,15 +264,15 @@ Developer Options:
 		case "--threads", "-threads":
 			i++
 			if i < len(os.Args) {
-				n, err := strconv.ParseUint(os.Args[i], 10, 16)
+				_, err := strconv.ParseUint(os.Args[i], 10, 16)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "threads must be a valid number\n")
 					os.Exit(1)
 				}
-				core.NumThreads = int(n)
+				showThreadsDisabled = true
 				continue
 			}
-			fmt.Fprintf(os.Stderr, "http-transport must be 'yes' or 'no'\n")
+			fmt.Fprintf(os.Stderr, "threads must be a valid number \n")
 			os.Exit(1)
 		case "--evio", "-evio":
 			i++
@@ -251,39 +285,72 @@ Developer Options:
 			}
 			fmt.Fprintf(os.Stderr, "evio must be 'yes' or 'no'\n")
 			os.Exit(1)
+		default:
+			nargs = append(nargs, os.Args[i])
 		}
-		nargs = append(nargs, os.Args[i])
 	}
 	os.Args = nargs
 
-	flag.IntVar(&port, "p", 9851, "The listening port.")
+	metricsAddr := flag.String("metrics-addr", "", "The listening addr for Prometheus metrics.")
+
+	var (
+		dir         string
+		port        int
+		host        string
+		unixSocket  string
+		verbose     bool
+		veryVerbose bool
+		logEncoding string
+		quiet       bool
+		pidfile     string
+		cpuprofile  string
+		memprofile  string
+		pprofport   int
+	)
+
+	flag.IntVar(&port, "p", 9851, "The listening port")
 	flag.StringVar(&pidfile, "pidfile", "", "A file that contains the pid")
-	flag.StringVar(&host, "h", "", "The listening host.")
-	flag.StringVar(&dir, "d", "data", "The data directory.")
-	flag.BoolVar(&verbose, "v", false, "Enable verbose logging.")
-	flag.BoolVar(&quiet, "q", false, "Quiet logging. Totally silent.")
-	flag.BoolVar(&veryVerbose, "vv", false, "Enable very verbose logging.")
+	flag.StringVar(&host, "h", "", "The listening host")
+	flag.StringVar(&unixSocket, "s", "", "Listen on a unix socket")
+	flag.StringVar(&dir, "d", "data", "The data directory")
+	flag.StringVar(&logEncoding, "l", "text", "The log encoding json or text (default: text)")
+	flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
+	flag.BoolVar(&quiet, "q", false, "Quiet logging. Totally silent")
+	flag.BoolVar(&veryVerbose, "vv", false, "Enable very verbose logging")
 	flag.IntVar(&pprofport, "pprofport", 0, "pprofport http at port")
 	flag.StringVar(&cpuprofile, "cpuprofile", "", "write cpu profile to `file`")
 	flag.StringVar(&memprofile, "memprofile", "", "write memory profile to `file`")
 	flag.Parse()
 
+	if logEncoding == "json" {
+		log.SetLogJSON(true)
+		data, _ := os.ReadFile(filepath.Join(dir, "config"))
+		if gjson.GetBytes(data, "logconfig.encoding").String() == "json" {
+			c := gjson.GetBytes(data, "logconfig").String()
+			log.Build(c)
+		} else {
+			log.Build("")
+		}
+	}
+
 	var logw io.Writer = os.Stderr
 	if quiet {
-		logw = ioutil.Discard
+		logw = io.Discard
 	}
+
 	log.SetOutput(logw)
+
 	if quiet {
-		log.Level = 0
+		log.SetLevel(0)
 	} else if veryVerbose {
-		log.Level = 3
+		log.SetLevel(3)
 	} else if verbose {
-		log.Level = 2
+		log.SetLevel(2)
 	} else {
-		log.Level = 1
+		log.SetLevel(1)
 	}
-	core.DevMode = devMode
-	core.ShowDebugMessages = veryVerbose
+
+	showDebugMessages = veryVerbose
 
 	hostd := ""
 	if host != "" {
@@ -339,6 +406,10 @@ Developer Options:
 		}()
 	}
 
+	if unixSocket != "" {
+		port = 0
+	}
+
 	// pid file
 	var pidferr error
 	var pidcleanedup bool
@@ -359,12 +430,11 @@ Developer Options:
 	}
 	defer pidcleanup()
 	if pidfile != "" {
-		pidferr := ioutil.WriteFile(pidfile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0666)
-		if pidferr == nil {
-		}
+		os.WriteFile(pidfile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0666)
 	}
 
 	c := make(chan os.Signal, 1)
+	shutdown := make(chan bool, 1)
 
 	signal.Notify(c, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
@@ -385,32 +455,59 @@ Developer Options:
 			case s == syscall.SIGQUIT:
 				os.Exit(3)
 			case s == syscall.SIGTERM:
-				os.Exit(0xf)
+				shutdown <- true
 			}
 		}
 	}()
 
-	//  _____ _ _     ___ ___
-	// |_   _|_| |___|_  | . |
-	//   | | | | | -_|_  | . |
-	//   |_| |_|_|___|___|___|
-	fmt.Fprintf(logw, `
-   _______ _______
-  |       |       |
-  |____   |   _   |   Tile38 %s%s %d bit (%s/%s)
-  |       |       |   %sPort: %d, PID: %d
-  |____   |   _   | 
-  |       |       |   tile38.com
-  |_______|_______| 
-`+"\n", core.Version, gitsha, strconv.IntSize, runtime.GOARCH, runtime.GOOS, hostd, port, os.Getpid())
+	var saddr string
+	if unixSocket != "" {
+		saddr = fmt.Sprintf("Socket: %s", unixSocket)
+	} else {
+		saddr = fmt.Sprintf("Port: %d", port)
+	}
+
+	if log.LogJSON() {
+		log.Printf(`Tile38 %s%s %d bit (%s/%s) %s%s, PID: %d. Visit tile38.com/sponsor to support the project`,
+			core.Version, gitsha, strconv.IntSize, runtime.GOARCH, runtime.GOOS, hostd, saddr, os.Getpid())
+	} else {
+		fmt.Fprintf(logw, `
+   _____ _ _     ___ ___
+  |_   _|_| |___|_  | . |  Tile38 %s%s %d bit (%s/%s)
+    | | | | | -_|_  | . |  %s%s, PID: %d
+    |_| |_|_|___|___|___|  tile38.com
+
+`, core.Version, gitsha, strconv.IntSize, runtime.GOARCH, runtime.GOOS, hostd,
+			saddr, os.Getpid())
+	}
+
 	if pidferr != nil {
 		log.Warnf("pidfile: %v", pidferr)
 	}
 	if showEvioDisabled {
-		// we don't currently support evio in Tile38
 		log.Warnf("evio is not currently supported")
 	}
-	if err := server.Serve(host, port, dir, httpTransport); err != nil {
+	if showThreadsDisabled {
+		log.Warnf("thread flag is deprecated use GOMAXPROCS to set number of threads instead")
+	}
+	opts := server.Options{
+		Host:              host,
+		Port:              port,
+		Dir:               dir,
+		UseHTTP:           httpTransport,
+		MetricsAddr:       *metricsAddr,
+		UnixSocketPath:    unixSocket,
+		DevMode:           devMode,
+		ShowDebugMessages: showDebugMessages,
+		ProtectedMode:     protectedMode,
+		AppendOnly:        appendOnly,
+		AppendFileName:    appendFileName,
+		QueueFileName:     queueFileName,
+		Shutdown:          shutdown,
+		Spinlock:          spinlock,
+		ClientOutput:      clientOutput,
+	}
+	if err := server.Serve(opts); err != nil {
 		log.Fatal(err)
 	}
 }

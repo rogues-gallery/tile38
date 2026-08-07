@@ -2,8 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
@@ -22,21 +20,25 @@ const (
 
 // Config keys
 const (
-	FollowHost    = "follow_host"
-	FollowPort    = "follow_port"
-	FollowID      = "follow_id"
-	FollowPos     = "follow_pos"
-	ServerID      = "server_id"
-	ReadOnly      = "read_only"
-	RequirePass   = "requirepass"
-	LeaderAuth    = "leaderauth"
-	ProtectedMode = "protected-mode"
-	MaxMemory     = "maxmemory"
-	AutoGC        = "autogc"
-	KeepAlive     = "keepalive"
+	FollowHost      = "follow_host"
+	FollowPort      = "follow_port"
+	FollowID        = "follow_id"
+	FollowPos       = "follow_pos"
+	ReplicaPriority = "replica-priority"
+	ServerID        = "server_id"
+	ReadOnly        = "read_only"
+	RequirePass     = "requirepass"
+	LeaderAuth      = "leaderauth"
+	ProtectedMode   = "protected-mode"
+	MaxMemory       = "maxmemory"
+	AutoGC          = "autogc"
+	KeepAlive       = "keepalive"
+	LogConfig       = "logconfig"
+	AnnounceIP      = "replica_announce_ip"
+	AnnouncePort    = "replica_announce_port"
 )
 
-var validProperties = []string{RequirePass, LeaderAuth, ProtectedMode, MaxMemory, AutoGC, KeepAlive}
+var validProperties = []string{RequirePass, LeaderAuth, ProtectedMode, MaxMemory, AutoGC, KeepAlive, LogConfig, ReplicaPriority, AnnouncePort, AnnounceIP}
 
 // Config is a tile38 config
 type Config struct {
@@ -44,12 +46,13 @@ type Config struct {
 
 	mu sync.RWMutex
 
-	_followHost string
-	_followPort int64
-	_followID   string
-	_followPos  int64
-	_serverID   string
-	_readOnly   bool
+	_followHost      string
+	_followPort      int64
+	_followID        string
+	_followPos       int64
+	_replicaPriority int64
+	_serverID        string
+	_readOnly        bool
 
 	_requirePassP   string
 	_requirePass    string
@@ -63,20 +66,25 @@ type Config struct {
 	_autoGC         uint64
 	_keepAliveP     string
 	_keepAlive      int64
+	_logConfigP     interface{}
+	_logConfig      string
+	_announceIPP    string
+	_announceIP     string
+	_announcePortP  string
+	_announcePort   int64
 }
 
 func loadConfig(path string) (*Config, error) {
 	var json string
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			json = `{"` + ServerID + `":"` + randomKey(16) + `"}`
-		} else {
+		if !os.IsNotExist(err) {
 			return nil, err
 		}
 	} else {
 		json = string(data)
 	}
+
 	config := &Config{
 		path:            path,
 		_followHost:     gjson.Get(json, FollowHost).String(),
@@ -91,7 +99,24 @@ func loadConfig(path string) (*Config, error) {
 		_maxMemoryP:     gjson.Get(json, MaxMemory).String(),
 		_autoGCP:        gjson.Get(json, AutoGC).String(),
 		_keepAliveP:     gjson.Get(json, KeepAlive).String(),
+		_logConfig:      gjson.Get(json, LogConfig).String(),
+		_announceIPP:    gjson.Get(json, AnnounceIP).String(),
+		_announcePortP:  gjson.Get(json, AnnouncePort).String(),
 	}
+
+	if config._serverID == "" {
+		config._serverID = randomKey(16)
+	}
+
+	// Need to be sure we look for existence vs not zero because zero is an intentional setting
+	// anything less than zero will be considered default and will result in no slave_priority
+	// being output when INFO is called.
+	if gjson.Get(json, ReplicaPriority).Exists() {
+		config._replicaPriority = gjson.Get(json, ReplicaPriority).Int()
+	} else {
+		config._replicaPriority = -1
+	}
+
 	// load properties
 	if err := config.setProperty(RequirePass, config._requirePassP, true); err != nil {
 		return nil, err
@@ -109,6 +134,15 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	if err := config.setProperty(KeepAlive, config._keepAliveP, true); err != nil {
+		return nil, err
+	}
+	if err := config.setProperty(LogConfig, config._logConfig, true); err != nil {
+		return nil, err
+	}
+	if err := config.setProperty(AnnounceIP, config._announceIPP, true); err != nil {
+		return nil, err
+	}
+	if err := config.setProperty(AnnouncePort, config._announcePortP, true); err != nil {
 		return nil, err
 	}
 	config.write(false)
@@ -139,6 +173,17 @@ func (config *Config) write(writeProperties bool) {
 		} else {
 			config._keepAliveP = strconv.FormatUint(uint64(config._keepAlive), 10)
 		}
+		if config._logConfig != "" {
+			config._logConfigP = config._logConfig
+		}
+		if config._announceIP != "" {
+			config._announceIPP = config._announceIP
+		}
+		if config._announcePort == 0 {
+			config._announcePortP = ""
+		} else {
+			config._announcePortP = strconv.FormatUint(uint64(config._announcePort), 10)
+		}
 	}
 
 	m := make(map[string]interface{})
@@ -153,6 +198,9 @@ func (config *Config) write(writeProperties bool) {
 	}
 	if config._followPos != 0 {
 		m[FollowPos] = config._followPos
+	}
+	if config._replicaPriority >= 0 {
+		m[ReplicaPriority] = config._replicaPriority
 	}
 	if config._serverID != "" {
 		m[ServerID] = config._serverID
@@ -178,12 +226,25 @@ func (config *Config) write(writeProperties bool) {
 	if config._keepAliveP != "" {
 		m[KeepAlive] = config._keepAliveP
 	}
+	if config._logConfigP != "" {
+		var lcfg map[string]interface{}
+		json.Unmarshal([]byte(config._logConfig), &lcfg)
+		if len(lcfg) > 0 {
+			m[LogConfig] = lcfg
+		}
+	}
+	if config._announceIPP != "" {
+		m[AnnounceIP] = config._announceIPP
+	}
+	if config._announcePortP != "" {
+		m[AnnouncePort] = config._announcePortP
+	}
 	data, err := json.MarshalIndent(m, "", "\t")
 	if err != nil {
 		panic(err)
 	}
 	data = append(data, '\n')
-	err = ioutil.WriteFile(config.path, data, 0600)
+	err = os.WriteFile(config.path, data, 0600)
 	if err != nil {
 		panic(err)
 	}
@@ -241,7 +302,7 @@ func (config *Config) setProperty(name, value string, fromLoad bool) error {
 	var invalid bool
 	switch name {
 	default:
-		return fmt.Errorf("Unsupported CONFIG parameter: %s", name)
+		return clientErrorf("Unsupported CONFIG parameter: %s", name)
 	case RequirePass:
 		config._requirePass = value
 	case LeaderAuth:
@@ -259,7 +320,7 @@ func (config *Config) setProperty(name, value string, fromLoad bool) error {
 	case MaxMemory:
 		sz, ok := parseMemSize(value)
 		if !ok {
-			return fmt.Errorf("Invalid argument '%s' for CONFIG SET '%s'", value, name)
+			return clientErrorf("Invalid argument '%s' for CONFIG SET '%s'", value, name)
 		}
 		config._maxMemory = sz
 	case ProtectedMode:
@@ -286,10 +347,36 @@ func (config *Config) setProperty(name, value string, fromLoad bool) error {
 				config._keepAlive = int64(keepalive)
 			}
 		}
+	case LogConfig:
+		if value == "" {
+			config._logConfig = ""
+		} else {
+			config._logConfig = value
+		}
+	case ReplicaPriority:
+		replicaPriority, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || replicaPriority < 0 {
+			invalid = true
+		} else {
+			config._replicaPriority = replicaPriority
+		}
+	case AnnounceIP:
+		config._announceIP = value
+	case AnnouncePort:
+		if value == "" {
+			config._announcePort = 0
+		} else {
+			announcePort, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				invalid = true
+			} else {
+				config._announcePort = int64(announcePort)
+			}
+		}
 	}
 
 	if invalid {
-		return fmt.Errorf("Invalid argument '%s' for CONFIG SET '%s'", value, name)
+		return clientErrorf("Invalid argument '%s' for CONFIG SET '%s'", value, name)
 	}
 	return nil
 }
@@ -323,10 +410,22 @@ func (config *Config) getProperty(name string) string {
 		return formatMemSize(config._maxMemory)
 	case KeepAlive:
 		return strconv.FormatUint(uint64(config._keepAlive), 10)
+	case LogConfig:
+		return config._logConfig
+	case ReplicaPriority:
+		if config._replicaPriority < 0 {
+			return ""
+		} else {
+			return strconv.FormatUint(uint64(config._replicaPriority), 10)
+		}
+	case AnnounceIP:
+		return config._announceIP
+	case AnnouncePort:
+		return strconv.FormatUint(uint64(config._announcePort), 10)
 	}
 }
 
-func (c *Server) cmdConfigGet(msg *Message) (res resp.Value, err error) {
+func (s *Server) cmdConfigGet(msg *Message) (res resp.Value, err error) {
 	start := time.Now()
 	vs := msg.Args[1:]
 	var ok bool
@@ -338,21 +437,21 @@ func (c *Server) cmdConfigGet(msg *Message) (res resp.Value, err error) {
 	if len(vs) != 0 {
 		return NOMessage, errInvalidNumberOfArguments
 	}
-	m := c.config.getProperties(name)
+	m := s.config.getProperties(name)
 	switch msg.OutputType {
 	case JSON:
 		data, err := json.Marshal(m)
 		if err != nil {
 			return NOMessage, err
 		}
-		res = resp.StringValue(`{"ok":true,"properties":` + string(data) + `,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		res = resp.StringValue(`{"ok":true,"properties":` + string(data) + `,"elapsed":"` + time.Since(start).String() + "\"}")
 	case RESP:
 		vals := respValuesSimpleMap(m)
 		res = resp.ArrayValue(vals)
 	}
 	return
 }
-func (c *Server) cmdConfigSet(msg *Message) (res resp.Value, err error) {
+func (s *Server) cmdConfigSet(msg *Message) (res resp.Value, err error) {
 	start := time.Now()
 	vs := msg.Args[1:]
 	var ok bool
@@ -370,19 +469,22 @@ func (c *Server) cmdConfigSet(msg *Message) (res resp.Value, err error) {
 	if len(vs) != 0 {
 		return NOMessage, errInvalidNumberOfArguments
 	}
-	if err := c.config.setProperty(name, value, false); err != nil {
+	if err := s.config.setProperty(name, value, false); err != nil {
 		return NOMessage, err
+	}
+	if name == MaxMemory {
+		s.checkOutOfMemory()
 	}
 	return OKMessage(msg, start), nil
 }
-func (c *Server) cmdConfigRewrite(msg *Message) (res resp.Value, err error) {
+func (s *Server) cmdConfigRewrite(msg *Message) (res resp.Value, err error) {
 	start := time.Now()
 	vs := msg.Args[1:]
 
 	if len(vs) != 0 {
 		return NOMessage, errInvalidNumberOfArguments
 	}
-	c.config.write(true)
+	s.config.write(true)
 	return OKMessage(msg, start), nil
 }
 
@@ -398,17 +500,11 @@ func (config *Config) followPort() int {
 	config.mu.RUnlock()
 	return int(v)
 }
-func (config *Config) followID() string {
+func (config *Config) replicaPriority() int {
 	config.mu.RLock()
-	v := config._followID
+	v := config._replicaPriority
 	config.mu.RUnlock()
-	return v
-}
-func (config *Config) followPos() int64 {
-	config.mu.RLock()
-	v := config._followPos
-	config.mu.RUnlock()
-	return v
+	return int(v)
 }
 func (config *Config) serverID() string {
 	config.mu.RLock()
@@ -458,6 +554,18 @@ func (config *Config) keepAlive() int64 {
 	config.mu.RUnlock()
 	return v
 }
+func (config *Config) announceIP() string {
+	config.mu.RLock()
+	v := config._announceIP
+	config.mu.RUnlock()
+	return v
+}
+func (config *Config) announcePort() int {
+	config.mu.RLock()
+	v := config._announcePort
+	config.mu.RUnlock()
+	return int(v)
+}
 func (config *Config) setFollowHost(v string) {
 	config.mu.Lock()
 	config._followHost = v
@@ -468,53 +576,8 @@ func (config *Config) setFollowPort(v int) {
 	config._followPort = int64(v)
 	config.mu.Unlock()
 }
-func (config *Config) setFollowID(v string) {
-	config.mu.Lock()
-	config._followID = v
-	config.mu.Unlock()
-}
-func (config *Config) setFollowPos(v int64) {
-	config.mu.Lock()
-	config._followPos = v
-	config.mu.Unlock()
-}
-func (config *Config) setServerID(v string) {
-	config.mu.Lock()
-	config._serverID = v
-	config.mu.Unlock()
-}
 func (config *Config) setReadOnly(v bool) {
 	config.mu.Lock()
 	config._readOnly = v
-	config.mu.Unlock()
-}
-func (config *Config) setRequirePass(v string) {
-	config.mu.Lock()
-	config._requirePass = v
-	config.mu.Unlock()
-}
-func (config *Config) setLeaderAuth(v string) {
-	config.mu.Lock()
-	config._leaderAuth = v
-	config.mu.Unlock()
-}
-func (config *Config) setProtectedMode(v string) {
-	config.mu.Lock()
-	config._protectedMode = v
-	config.mu.Unlock()
-}
-func (config *Config) setMaxMemory(v int) {
-	config.mu.Lock()
-	config._maxMemory = int64(v)
-	config.mu.Unlock()
-}
-func (config *Config) setAutoGC(v uint64) {
-	config.mu.Lock()
-	config._autoGC = v
-	config.mu.Unlock()
-}
-func (config *Config) setKeepAlive(v int64) {
-	config.mu.Lock()
-	config._keepAlive = v
 	config.mu.Unlock()
 }

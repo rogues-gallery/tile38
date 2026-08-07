@@ -221,7 +221,7 @@ func main() {
 			}
 			subtract = true
 			for i := range testsArr {
-				if strings.ToLower(testsArr[i]) == strings.ToLower(test[1:]) {
+				if strings.EqualFold(testsArr[i], test[1:]) {
 					testsArr = append(testsArr[:i], testsArr[i+1:]...)
 					break
 				}
@@ -261,7 +261,7 @@ func main() {
 				)
 			}
 
-		case "SET", "SET-POINT", "SET-RECT", "SET-STRING":
+		case "SET", "SET-POINT", "SET-RECT", "SET-LINE", "SET-STRING":
 			if redis {
 				redbench.Bench("SET", addr, opts, prepFn,
 					func(buf []byte) []byte {
@@ -294,6 +294,22 @@ func main() {
 								strconv.FormatFloat(minlon, 'f', 5, 64),
 								strconv.FormatFloat(maxlat, 'f', 5, 64),
 								strconv.FormatFloat(maxlon, 'f', 5, 64),
+							)
+						},
+					)
+				}
+				switch strings.ToUpper(strings.TrimSpace(test)) {
+				case "SET", "SET-LINE":
+					redbench.Bench("SET (line)", addr, opts, prepFn,
+						func(buf []byte) []byte {
+							i := atomic.AddInt64(&i, 1)
+							alat, alon, blat, blon := randRect(10000)
+							if rand.Int()%2 == 0 {
+								alat, alon, blat, blon = blat, blon, alat, alon
+							}
+							linestring := fmt.Sprintf(`{"type":"LineString","coordinates":[[%f,%f],[%f,%f]]}`, alon, alat, blon, blat)
+							return redbench.AppendCommand(buf, "SET", "key:bench", "id:"+strconv.FormatInt(i, 10), "OBJECT",
+								linestring,
 							)
 						},
 					)

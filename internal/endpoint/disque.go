@@ -9,9 +9,7 @@ import (
 	"github.com/tidwall/tile38/internal/log"
 )
 
-const (
-	disqueExpiresAfter = time.Second * 30
-)
+const disqueExpiresAfter = time.Second * 30
 
 // DisqueConn is an endpoint connection
 type DisqueConn struct {
@@ -34,14 +32,20 @@ func (conn *DisqueConn) Expired() bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	if !conn.ex {
-		if time.Now().Sub(conn.t) > disqueExpiresAfter {
-			if conn.conn != nil {
-				conn.close()
-			}
+		if time.Since(conn.t) > disqueExpiresAfter {
+			conn.close()
 			conn.ex = true
 		}
 	}
 	return conn.ex
+}
+
+// ExpireNow forces the connection to expire
+func (conn *DisqueConn) ExpireNow() {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	conn.close()
+	conn.ex = true
 }
 
 func (conn *DisqueConn) close() {

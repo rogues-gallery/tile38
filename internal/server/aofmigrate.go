@@ -83,15 +83,15 @@ func NewLegacyAOFReader(r io.Reader) *LegacyAOFReader {
 	return rd
 }
 
-func (c *Server) migrateAOF() error {
-	_, err := os.Stat(path.Join(c.dir, "appendonly.aof"))
+func (s *Server) migrateAOF() error {
+	_, err := os.Stat(path.Join(s.dir, "appendonly.aof"))
 	if err == nil {
 		return nil
 	}
 	if !os.IsNotExist(err) {
 		return err
 	}
-	_, err = os.Stat(path.Join(c.dir, "aof"))
+	_, err = os.Stat(path.Join(s.dir, "aof"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -99,13 +99,13 @@ func (c *Server) migrateAOF() error {
 		return err
 	}
 	log.Warn("Migrating aof to new format")
-	newf, err := os.Create(path.Join(c.dir, "migrate.aof"))
+	newf, err := os.Create(path.Join(s.dir, "migrate.aof"))
 	if err != nil {
 		return err
 	}
 	defer newf.Close()
 
-	oldf, err := os.Open(path.Join(c.dir, "aof"))
+	oldf, err := os.Open(path.Join(s.dir, "aof"))
 	if err != nil {
 		return err
 	}
@@ -154,6 +154,6 @@ func (c *Server) migrateAOF() error {
 	}
 	oldf.Close()
 	newf.Close()
-	log.Debugf("%d items: %.0f/sec", count, float64(count)/(float64(time.Now().Sub(start))/float64(time.Second)))
-	return os.Rename(path.Join(c.dir, "migrate.aof"), path.Join(c.dir, "appendonly.aof"))
+	log.Debugf("%d items: %.0f/sec", count, float64(count)/(float64(time.Since(start))/float64(time.Second)))
+	return os.Rename(path.Join(s.dir, "migrate.aof"), path.Join(s.dir, "appendonly.aof"))
 }

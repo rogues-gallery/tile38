@@ -4,19 +4,18 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
-	"testing"
 	"time"
 
 	"github.com/gomodule/redigo/redis"
 )
 
-func subTestTimeout(t *testing.T, mc *mockServer) {
-	runStep(t, mc, "spatial", timeout_spatial_test)
-	runStep(t, mc, "search", timeout_search_test)
-	runStep(t, mc, "scripts", timeout_scripts_test)
-	runStep(t, mc, "no writes", timeout_no_writes_test)
-	runStep(t, mc, "within scripts", timeout_within_scripts_test)
-	runStep(t, mc, "no writes within scripts", timeout_no_writes_within_scripts_test)
+func subTestTimeout(g *testGroup) {
+	g.regSubTest("spatial", timeout_spatial_test)
+	g.regSubTest("search", timeout_search_test)
+	g.regSubTest("scripts", timeout_scripts_test)
+	g.regSubTest("no writes", timeout_no_writes_test)
+	g.regSubTest("within scripts", timeout_within_scripts_test)
+	g.regSubTest("no writes within scripts", timeout_no_writes_within_scripts_test)
 }
 
 func setup(mc *mockServer, count int, points bool) (err error) {
@@ -54,22 +53,27 @@ func setup(mc *mockServer, count int, points bool) (err error) {
 	return
 }
 
-func timeout_spatial_test(mc *mockServer) (err error) {
-	err = setup(mc, 10000, true)
+func timeout_spatial_test(mc *mockServer) error {
+	err := setup(mc, 10000, true)
+	if err != nil {
+		return err
+	}
+	return mc.DoBatch(
+		Do("SCAN", "mykey", "WHERE", "foo", -1, 2, "COUNT").Str("10000"),
+		Do("INTERSECTS", "mykey", "WHERE", "foo", -1, 2, "COUNT", "BOUNDS", -90, -180, 90, 180).Str("10000"),
+		Do("WITHIN", "mykey", "WHERE", "foo", -1, 2, "COUNT", "BOUNDS", -90, -180, 90, 180).Str("10000"),
 
-	return mc.DoBatch([][]interface{}{
-		{"SCAN", "mykey", "WHERE", "foo", -1, 2, "COUNT"}, {"10000"},
-		{"INTERSECTS", "mykey", "WHERE", "foo", -1, 2, "COUNT", "BOUNDS", -90, -180, 90, 180}, {"10000"},
-		{"WITHIN", "mykey", "WHERE", "foo", -1, 2, "COUNT", "BOUNDS", -90, -180, 90, 180}, {"10000"},
-
-		{"TIMEOUT", "0.000001", "SCAN", "mykey", "WHERE", "foo", -1, 2, "COUNT"}, {"ERR timeout"},
-		{"TIMEOUT", "0.000001", "INTERSECTS", "mykey", "WHERE", "foo", -1, 2, "COUNT", "BOUNDS", -90, -180, 90, 180}, {"ERR timeout"},
-		{"TIMEOUT", "0.000001", "WITHIN", "mykey", "WHERE", "foo", -1, 2, "COUNT", "BOUNDS", -90, -180, 90, 180}, {"ERR timeout"},
-	})
+		Do("TIMEOUT", "0.000001", "SCAN", "mykey", "WHERE", "foo", -1, 2, "COUNT").Err("timeout"),
+		Do("TIMEOUT", "0.000001", "INTERSECTS", "mykey", "WHERE", "foo", -1, 2, "COUNT", "BOUNDS", -90, -180, 90, 180).Err("timeout"),
+		Do("TIMEOUT", "0.000001", "WITHIN", "mykey", "WHERE", "foo", -1, 2, "COUNT", "BOUNDS", -90, -180, 90, 180).Err("timeout"),
+	)
 }
 
 func timeout_search_test(mc *mockServer) (err error) {
 	err = setup(mc, 10000, false)
+	if err != nil {
+		return err
+	}
 
 	return mc.DoBatch([][]interface{}{
 		{"SEARCH", "mykey", "MATCH", "val:*", "COUNT"}, {"10000"},
@@ -122,6 +126,9 @@ func scriptTimeoutErr(v interface{}) (resp, expect interface{}) {
 
 func timeout_within_scripts_test(mc *mockServer) (err error) {
 	err = setup(mc, 10000, true)
+	if err != nil {
+		return err
+	}
 
 	script1 := "return tile38.call('timeout', 10, 'SCAN', 'mykey', 'WHERE', 'foo', -1, 2, 'COUNT')"
 	script2 := "return tile38.call('timeout', 0.000001, 'SCAN', 'mykey', 'WHERE', 'foo', -1, 2, 'COUNT')"

@@ -7,35 +7,31 @@ import (
 	"github.com/tidwall/resp"
 )
 
-func (c *Server) cmdOutput(msg *Message) (res resp.Value, err error) {
+// OUTPUT [resp|json]
+func (s *Server) cmdOUTPUT(msg *Message) (resp.Value, error) {
 	start := time.Now()
-	vs := msg.Args[1:]
-	var arg string
-	var ok bool
 
-	if len(vs) != 0 {
-		if _, arg, ok = tokenval(vs); !ok || arg == "" {
-			return NOMessage, errInvalidNumberOfArguments
+	args := msg.Args
+	switch len(args) {
+	case 1:
+		if msg.OutputType == JSON {
+			return resp.StringValue(`{"ok":true,"output":"json","elapsed":` +
+				time.Since(start).String() + `}`), nil
 		}
+		return resp.StringValue("resp"), nil
+	case 2:
 		// Setting the original message output type will be picked up by the
 		// server prior to the next command being executed.
-		switch strings.ToLower(arg) {
+		switch strings.ToLower(args[1]) {
 		default:
-			return NOMessage, errInvalidArgument(arg)
+			return retrerr(errInvalidArgument(args[1]))
 		case "json":
 			msg.OutputType = JSON
 		case "resp":
 			msg.OutputType = RESP
 		}
 		return OKMessage(msg, start), nil
-	}
-	// return the output
-	switch msg.OutputType {
 	default:
-		return NOMessage, nil
-	case JSON:
-		return resp.StringValue(`{"ok":true,"output":"json","elapsed":` + time.Now().Sub(start).String() + `}`), nil
-	case RESP:
-		return resp.StringValue("resp"), nil
+		return retrerr(errInvalidNumberOfArguments)
 	}
 }

@@ -9,9 +9,7 @@ import (
 	"github.com/streadway/amqp"
 )
 
-const (
-	amqpExpiresAfter = time.Second * 30
-)
+const amqpExpiresAfter = time.Second * 30
 
 // AMQPConn is an endpoint connection
 type AMQPConn struct {
@@ -28,12 +26,23 @@ func (conn *AMQPConn) Expired() bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	if !conn.ex {
-		if time.Now().Sub(conn.t) > amqpExpiresAfter {
-			conn.ex = true
+		if time.Since(conn.t) > amqpExpiresAfter {
 			conn.close()
+			conn.ex = true
+		} else if conn.conn != nil && conn.conn.IsClosed() {
+			conn.close()
+			conn.ex = true
 		}
 	}
 	return conn.ex
+}
+
+// ExpireNow forces the connection to expire
+func (conn *AMQPConn) ExpireNow() {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	conn.close()
+	conn.ex = true
 }
 
 func (conn *AMQPConn) close() {
@@ -53,6 +62,10 @@ func (conn *AMQPConn) Send(msg string) error {
 		return errExpired
 	}
 	conn.t = time.Now()
+
+	if conn.conn != nil && conn.conn.IsClosed() {
+		conn.close()
+	}
 
 	if conn.conn == nil {
 		prefix := "amqp://"
@@ -87,35 +100,35 @@ func (conn *AMQPConn) Send(msg string) error {
 		); err != nil {
 			return err
 		}
+		if conn.ep.AMQP.Type != "topic" {
+			// Create queue if queue don't exists
+			if _, err := channel.QueueDeclare(
+				conn.ep.AMQP.QueueName,
+				conn.ep.AMQP.Durable,
+				conn.ep.AMQP.AutoDelete,
+				false,
+				conn.ep.AMQP.NoWait,
+				nil,
+			); err != nil {
+				return err
+			}
 
-		// Create queue if queue don't exists
-		if _, err := channel.QueueDeclare(
-			conn.ep.AMQP.QueueName,
-			conn.ep.AMQP.Durable,
-			conn.ep.AMQP.AutoDelete,
-			false,
-			conn.ep.AMQP.NoWait,
-			nil,
-		); err != nil {
-			return err
+			// Binding exchange to queue
+			if err := channel.QueueBind(
+				conn.ep.AMQP.QueueName,
+				conn.ep.AMQP.RouteKey,
+				conn.ep.AMQP.QueueName,
+				conn.ep.AMQP.NoWait,
+				nil,
+			); err != nil {
+				return err
+			}
 		}
-
-		// Binding exchange to queue
-		if err := channel.QueueBind(
-			conn.ep.AMQP.QueueName,
-			conn.ep.AMQP.RouteKey,
-			conn.ep.AMQP.QueueName,
-			conn.ep.AMQP.NoWait,
-			nil,
-		); err != nil {
-			return err
-		}
-
 		conn.conn = c
 		conn.channel = channel
 	}
 
-	return conn.channel.Publish(
+	err := conn.channel.Publish(
 		conn.ep.AMQP.QueueName,
 		conn.ep.AMQP.RouteKey,
 		conn.ep.AMQP.Mandatory,
@@ -126,9 +139,15 @@ func (conn *AMQPConn) Send(msg string) error {
 			ContentEncoding: "",
 			Body:            []byte(msg),
 			DeliveryMode:    conn.ep.AMQP.DeliveryMode,
-			Priority:        0,
+			Priority:        conn.ep.AMQP.Priority,
 		},
 	)
+
+	if err != nil {
+		conn.close()
+	}
+
+	return err
 }
 
 func newAMQPConn(ep Endpoint) *AMQPConn {

@@ -12,6 +12,8 @@ import (
 	"github.com/tidwall/resp"
 	"github.com/tidwall/sjson"
 	"github.com/tidwall/tile38/internal/collection"
+	"github.com/tidwall/tile38/internal/field"
+	"github.com/tidwall/tile38/internal/object"
 )
 
 func appendJSONString(b []byte, s string) []byte {
@@ -40,6 +42,83 @@ func jsonString(s string) string {
 	b[len(b)-1] = '"'
 	return string(b)
 }
+
+func isJSONNumber(data string) bool {
+	// Returns true if the given string can be encoded as a JSON number value.
+	// See:
+	// https://json.org
+	// http://www.ecma-international.org/publications/files/ECMA-ST/ECMA-404.pdf
+	if data == "" {
+		return false
+	}
+	i := 0
+	// sign
+	if data[i] == '-' {
+		i++
+	}
+	if i == len(data) {
+		return false
+	}
+	// int
+	if data[i] == '0' {
+		i++
+	} else {
+		for ; i < len(data); i++ {
+			if data[i] >= '0' && data[i] <= '9' {
+				continue
+			}
+			break
+		}
+	}
+	// frac
+	if i == len(data) {
+		return true
+	}
+	if data[i] == '.' {
+		i++
+		if i == len(data) {
+			return false
+		}
+		if data[i] < '0' || data[i] > '9' {
+			return false
+		}
+		i++
+		for ; i < len(data); i++ {
+			if data[i] >= '0' && data[i] <= '9' {
+				continue
+			}
+			break
+		}
+	}
+	// exp
+	if i == len(data) {
+		return true
+	}
+	if data[i] == 'e' || data[i] == 'E' {
+		i++
+		if i == len(data) {
+			return false
+		}
+		if data[i] == '+' || data[i] == '-' {
+			i++
+		}
+		if i == len(data) {
+			return false
+		}
+		if data[i] < '0' || data[i] > '9' {
+			return false
+		}
+		i++
+		for ; i < len(data); i++ {
+			if data[i] >= '0' && data[i] <= '9' {
+				continue
+			}
+			break
+		}
+	}
+	return i == len(data)
+}
+
 func appendJSONSimpleBounds(dst []byte, o geojson.Object) []byte {
 	bbox := o.Rect()
 	dst = append(dst, `{"sw":{"lat":`...)
@@ -56,10 +135,7 @@ func appendJSONSimpleBounds(dst []byte, o geojson.Object) []byte {
 
 func appendJSONSimplePoint(dst []byte, o geojson.Object) []byte {
 	point := o.Center()
-	var z float64
-	if gPoint, ok := o.(*geojson.Point); ok {
-		z = gPoint.Z()
-	}
+	z := extractZCoordinate(o)
 	dst = append(dst, `{"lat":`...)
 	dst = strconv.AppendFloat(dst, point.Y, 'f', -1, 64)
 	dst = append(dst, `,"lon":`...)
@@ -85,7 +161,7 @@ func jsonTimeFormat(t time.Time) string {
 	return string(b)
 }
 
-func (c *Server) cmdJget(msg *Message) (resp.Value, error) {
+func (s *Server) cmdJget(msg *Message) (resp.Value, error) {
 	start := time.Now()
 
 	if len(msg.Args) < 3 {
@@ -110,15 +186,15 @@ func (c *Server) cmdJget(msg *Message) (resp.Value, error) {
 			}
 		}
 	}
-	col := c.getCol(key)
+	col, _ := s.cols.Get(key)
 	if col == nil {
 		if msg.OutputType == RESP {
 			return resp.NullValue(), nil
 		}
 		return NOMessage, errKeyNotFound
 	}
-	o, _, ok := col.Get(id)
-	if !ok {
+	o := col.Get(id)
+	if o == nil {
 		if msg.OutputType == RESP {
 			return resp.NullValue(), nil
 		}
@@ -126,9 +202,9 @@ func (c *Server) cmdJget(msg *Message) (resp.Value, error) {
 	}
 	var res gjson.Result
 	if doget {
-		res = gjson.Get(o.String(), path)
+		res = gjson.Get(o.Geo().String(), path)
 	} else {
-		res = gjson.Parse(o.String())
+		res = gjson.Parse(o.Geo().String())
 	}
 	var val string
 	if raw {
@@ -145,7 +221,7 @@ func (c *Server) cmdJget(msg *Message) (resp.Value, error) {
 		if res.Exists() {
 			buf.WriteString(`,"value":` + jsonString(val))
 		}
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
 	case RESP:
 		if !res.Exists() {
@@ -156,7 +232,7 @@ func (c *Server) cmdJget(msg *Message) (resp.Value, error) {
 	return NOMessage, nil
 }
 
-func (c *Server) cmdJset(msg *Message) (res resp.Value, d commandDetails, err error) {
+func (s *Server) cmdJset(msg *Message) (res resp.Value, d commandDetails, err error) {
 	// JSET key path value [RAW]
 	start := time.Now()
 
@@ -183,18 +259,12 @@ func (c *Server) cmdJset(msg *Message) (res resp.Value, d commandDetails, err er
 	if !str && !raw {
 		switch val {
 		default:
-			if len(val) > 0 {
-				if (val[0] >= '0' && val[0] <= '9') || val[0] == '-' {
-					if _, err := strconv.ParseFloat(val, 64); err == nil {
-						raw = true
-					}
-				}
-			}
+			raw = isJSONNumber(val)
 		case "true", "false", "null":
 			raw = true
 		}
 	}
-	col := c.getCol(key)
+	col, _ := s.cols.Get(key)
 	var createcol bool
 	if col == nil {
 		col = collection.New()
@@ -202,10 +272,12 @@ func (c *Server) cmdJset(msg *Message) (res resp.Value, d commandDetails, err er
 	}
 	var json string
 	var geoobj bool
-	o, _, ok := col.Get(id)
-	if ok {
-		geoobj = objIsSpatial(o)
-		json = o.String()
+	var fields field.List
+	o := col.Get(id)
+	if o != nil {
+		geoobj = objIsSpatial(o.Geo())
+		json = o.Geo().String()
+		fields = o.Fields()
 	}
 	if raw {
 		// set as raw block
@@ -222,25 +294,25 @@ func (c *Server) cmdJset(msg *Message) (res resp.Value, d commandDetails, err er
 		nmsg := *msg
 		nmsg.Args = []string{"SET", key, id, "OBJECT", json}
 		// SET key id OBJECT json
-		return c.cmdSet(&nmsg)
+		return s.cmdSET(&nmsg)
 	}
 	if createcol {
-		c.setCol(key, col)
+		s.cols.Set(key, col)
 	}
+	var oobj geojson.Object = collection.String(json)
+	obj := object.New(id, oobj, 0, fields)
+	col.Set(obj)
 
 	d.key = key
-	d.id = id
-	d.obj = collection.String(json)
+	d.obj = obj
 	d.timestamp = time.Now()
 	d.updated = true
 
-	c.clearIDExpires(key, id)
-	col.Set(d.id, d.obj, nil, nil)
 	switch msg.OutputType {
 	case JSON:
 		var buf bytes.Buffer
 		buf.WriteString(`{"ok":true`)
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), d, nil
 	case RESP:
 		return resp.SimpleStringValue("OK"), d, nil
@@ -248,7 +320,7 @@ func (c *Server) cmdJset(msg *Message) (res resp.Value, d commandDetails, err er
 	return NOMessage, d, nil
 }
 
-func (c *Server) cmdJdel(msg *Message) (res resp.Value, d commandDetails, err error) {
+func (s *Server) cmdJdel(msg *Message) (res resp.Value, d commandDetails, err error) {
 	start := time.Now()
 
 	if len(msg.Args) != 4 {
@@ -258,7 +330,7 @@ func (c *Server) cmdJdel(msg *Message) (res resp.Value, d commandDetails, err er
 	id := msg.Args[2]
 	path := msg.Args[3]
 
-	col := c.getCol(key)
+	col, _ := s.cols.Get(key)
 	if col == nil {
 		if msg.OutputType == RESP {
 			return resp.IntegerValue(0), d, nil
@@ -268,10 +340,12 @@ func (c *Server) cmdJdel(msg *Message) (res resp.Value, d commandDetails, err er
 
 	var json string
 	var geoobj bool
-	o, _, ok := col.Get(id)
-	if ok {
-		geoobj = objIsSpatial(o)
-		json = o.String()
+	var fields field.List
+	o := col.Get(id)
+	if o != nil {
+		geoobj = objIsSpatial(o.Geo())
+		json = o.Geo().String()
+		fields = o.Fields()
 	}
 	njson, err := sjson.Delete(json, path)
 	if err != nil {
@@ -291,22 +365,22 @@ func (c *Server) cmdJdel(msg *Message) (res resp.Value, d commandDetails, err er
 		nmsg := *msg
 		nmsg.Args = []string{"SET", key, id, "OBJECT", json}
 		// SET key id OBJECT json
-		return c.cmdSet(&nmsg)
+		return s.cmdSET(&nmsg)
 	}
 
+	var oobj geojson.Object = collection.String(json)
+	obj := object.New(id, oobj, 0, fields)
+	col.Set(obj)
+
 	d.key = key
-	d.id = id
-	d.obj = collection.String(json)
+	d.obj = obj
 	d.timestamp = time.Now()
 	d.updated = true
-
-	c.clearIDExpires(d.key, d.id)
-	col.Set(d.id, d.obj, nil, nil)
 	switch msg.OutputType {
 	case JSON:
 		var buf bytes.Buffer
 		buf.WriteString(`{"ok":true`)
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), d, nil
 	case RESP:
 		return resp.IntegerValue(1), d, nil

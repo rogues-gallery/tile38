@@ -7,32 +7,49 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
+	"github.com/tidwall/redcon"
 	"github.com/tidwall/tile38/internal/log"
+	"go.uber.org/atomic"
 )
 
 type liveBuffer struct {
 	key     string
-	glob    string
+	globs   []string
 	fence   *liveFenceSwitches
 	details []*commandDetails
 	cond    *sync.Cond
 }
 
-func (server *Server) processLives() {
-	server.lcond.L.Lock()
-	defer server.lcond.L.Unlock()
+func (s *Server) processLives(wg *sync.WaitGroup) {
+	defer wg.Done()
+	var done atomic.Bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			if done.Load() {
+				break
+			}
+			s.lcond.Broadcast()
+			time.Sleep(time.Second / 4)
+		}
+	}()
+	s.lcond.L.Lock()
+	defer s.lcond.L.Unlock()
 	for {
-		if server.stopServer.on() {
+		if s.stopServer.Load() {
+			done.Store(true)
 			return
 		}
-		for len(server.lstack) > 0 {
-			item := server.lstack[0]
-			server.lstack = server.lstack[1:]
-			if len(server.lstack) == 0 {
-				server.lstack = nil
+		for len(s.lstack) > 0 {
+			item := s.lstack[0]
+			s.lstack = s.lstack[1:]
+			if len(s.lstack) == 0 {
+				s.lstack = nil
 			}
-			for lb := range server.lives {
+			for lb := range s.lives {
 				lb.cond.L.Lock()
 				if lb.key != "" && lb.key == item.key {
 					lb.details = append(lb.details, item)
@@ -41,7 +58,7 @@ func (server *Server) processLives() {
 				lb.cond.L.Unlock()
 			}
 		}
-		server.lcond.Wait()
+		s.lcond.Wait()
 	}
 }
 
@@ -71,7 +88,7 @@ func writeLiveMessage(
 	return err
 }
 
-func (server *Server) goLive(
+func (s *Server) goLive(
 	inerr error, conn net.Conn, rd *PipelineReader, msg *Message, websocket bool,
 ) error {
 	addr := conn.RemoteAddr().String()
@@ -79,13 +96,15 @@ func (server *Server) goLive(
 	defer func() {
 		log.Info("not live " + addr)
 	}()
-	switch s := inerr.(type) {
+	switch lfs := inerr.(type) {
 	default:
 		return errors.New("invalid live type switches")
 	case liveAOFSwitches:
-		return server.liveAOF(s.pos, conn, rd, msg)
+		return s.liveAOF(lfs.pos, conn, rd, msg)
 	case liveSubscriptionSwitches:
-		return server.liveSubscription(conn, rd, msg, websocket)
+		return s.liveSubscription(conn, rd, msg, websocket)
+	case liveMonitorSwitches:
+		return s.liveMonitor(conn, rd, msg)
 	case liveFenceSwitches:
 		// fallthrough
 	}
@@ -97,27 +116,28 @@ func (server *Server) goLive(
 	var err error
 	var sw *scanWriter
 	var wr bytes.Buffer
-	s := inerr.(liveFenceSwitches)
-	lb.glob = s.glob
-	lb.key = s.key
-	lb.fence = &s
-	server.mu.RLock()
-	sw, err = server.newScanWriter(
-		&wr, msg, s.key, s.output, s.precision, s.glob, false,
-		s.cursor, s.limit, s.wheres, s.whereins, s.whereevals, s.nofields)
-	server.mu.RUnlock()
+	lfs := inerr.(liveFenceSwitches)
+	lb.globs = lfs.globs
+	lb.key = lfs.key
+	lb.fence = &lfs
+	s.mu.RLock()
+	sw, err = s.newScanWriter(
+		&wr, msg, lfs.key, lfs.output, lfs.precision, lfs.globs, false,
+		lfs.cursor, lfs.limit, lfs.wheres, lfs.whereins, lfs.whereevals,
+		lfs.nofields, lfs.mvt, lfs.tileX, lfs.tileY, lfs.tileZ)
+	s.mu.RUnlock()
 
 	// everything below if for live SCAN, NEARBY, WITHIN, INTERSECTS
 	if err != nil {
 		return err
 	}
-	server.lcond.L.Lock()
-	server.lives[lb] = true
-	server.lcond.L.Unlock()
+	s.lcond.L.Lock()
+	s.lives[lb] = true
+	s.lcond.L.Unlock()
 	defer func() {
-		server.lcond.L.Lock()
-		delete(server.lives, lb)
-		server.lcond.L.Unlock()
+		s.lcond.L.Lock()
+		delete(s.lives, lb)
+		s.lcond.L.Unlock()
 		conn.Close()
 	}()
 
@@ -160,9 +180,9 @@ func (server *Server) goLive(
 	var livemsg []byte
 	switch outputType {
 	case JSON:
-		livemsg = []byte(`{"ok":true,"live":true}`)
+		livemsg = redcon.AppendBulkString(nil, `{"ok":true,"live":true}`)
 	case RESP:
-		livemsg = []byte("+OK\r\n")
+		livemsg = redcon.AppendOK(nil)
 	}
 	if err := writeLiveMessage(conn, livemsg, false, connType, websocket); err != nil {
 		return nil // nil return is fine here
@@ -184,8 +204,8 @@ func (server *Server) goLive(
 			var msgs []string
 			func() {
 				// safely lock the fence because we are outside the main loop
-				server.mu.RLock()
-				defer server.mu.RUnlock()
+				s.mu.Lock()
+				defer s.mu.Unlock()
 				msgs = FenceMatch("", sw, fence, nil, details)
 			}()
 			for _, msg := range msgs {
@@ -193,7 +213,7 @@ func (server *Server) goLive(
 					return nil // nil return is fine here
 				}
 			}
-			server.statsTotalMsgsSent.add(len(msgs))
+			s.statsTotalMsgsSent.Add(int64(len(msgs)))
 			lb.cond.L.Lock()
 
 		}

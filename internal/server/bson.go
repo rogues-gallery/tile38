@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
-	"io"
 	"os"
 	"sync/atomic"
 	"time"
@@ -23,23 +22,17 @@ func bsonID() string {
 var (
 	bsonProcess = uint16(os.Getpid())
 	bsonMachine = func() []byte {
-		host, err := os.Hostname()
-		if err != nil {
-			b := make([]byte, 3)
-			if _, err := io.ReadFull(rand.Reader, b); err != nil {
-				panic("random error: " + err.Error())
-			}
-			return b
-		}
+		host, _ := os.Hostname()
+		b := make([]byte, 3)
+		Must(rand.Read(b))
+		host = Default(host, string(b))
 		hw := md5.New()
 		hw.Write([]byte(host))
 		return hw.Sum(nil)[:3]
 	}()
 	bsonCounter = func() uint32 {
 		b := make([]byte, 4)
-		if _, err := io.ReadFull(rand.Reader, b); err != nil {
-			panic("random error: " + err.Error())
-		}
+		Must(rand.Read(b))
 		return binary.BigEndian.Uint32(b)
 	}()
 )

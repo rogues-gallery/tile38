@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/iwpnd/sectr"
 	"github.com/mmcloughlin/geohash"
 	"github.com/tidwall/geojson"
 	"github.com/tidwall/geojson/geometry"
@@ -47,6 +48,67 @@ func (s *Server) parseArea(ovs []string, doClip bool) (vs []string, o geojson.Ob
 			return
 		}
 		o = geojson.NewPoint(geometry.Point{X: lon, Y: lat})
+	case "sector":
+		if doClip {
+			err = fmt.Errorf("invalid clip type '%s'", typ)
+			return
+		}
+		var slat, slon, smeters, sb1, sb2 string
+		if vs, slat, ok = tokenval(vs); !ok || slat == "" {
+			err = errInvalidNumberOfArguments
+			return
+		}
+		if vs, slon, ok = tokenval(vs); !ok || slon == "" {
+			err = errInvalidNumberOfArguments
+			return
+		}
+		if vs, smeters, ok = tokenval(vs); !ok || smeters == "" {
+			err = errInvalidNumberOfArguments
+			return
+		}
+		if vs, sb1, ok = tokenval(vs); !ok || sb1 == "" {
+			err = errInvalidNumberOfArguments
+			return
+		}
+		if vs, sb2, ok = tokenval(vs); !ok || sb2 == "" {
+			err = errInvalidNumberOfArguments
+			return
+		}
+		var lat, lon, meters, b1, b2 float64
+		if lat, err = strconv.ParseFloat(slat, 64); err != nil {
+			err = errInvalidArgument(slat)
+			return
+		}
+		if lon, err = strconv.ParseFloat(slon, 64); err != nil {
+			err = errInvalidArgument(slon)
+			return
+		}
+		if meters, err = strconv.ParseFloat(smeters, 64); err != nil {
+			err = errInvalidArgument(smeters)
+			return
+		}
+		if b1, err = strconv.ParseFloat(sb1, 64); err != nil {
+			err = errInvalidArgument(sb1)
+			return
+		}
+		if b2, err = strconv.ParseFloat(sb2, 64); err != nil {
+			err = errInvalidArgument(sb2)
+			return
+		}
+
+		if b1 == b2 {
+			err = fmt.Errorf("equal bearings (%s == %s), use CIRCLE instead", sb1, sb2)
+			return
+		}
+
+		origin := sectr.Point{Lng: lon, Lat: lat}
+		sector := sectr.NewSector(origin, meters, b1, b2)
+
+		o, err = geojson.Parse(string(sector.JSON()), &s.geomParseOpts)
+		if err != nil {
+			return
+		}
+
 	case "circle":
 		if doClip {
 			err = fmt.Errorf("invalid clip type '%s'", typ)
@@ -211,28 +273,37 @@ func (s *Server) parseArea(ovs []string, doClip bool) (vs []string, o geojson.Ob
 			err = errInvalidNumberOfArguments
 			return
 		}
-		col := s.getCol(key)
+		col, _ := s.cols.Get(key)
 		if col == nil {
 			err = errKeyNotFound
 			return
 		}
-		o, _, ok = col.Get(id)
-		if !ok {
+		obj := col.Get(id)
+		if obj == nil {
 			err = errIDNotFound
 			return
 		}
+		o = obj.Geo()
 	}
 	return
 }
 
-func (s *Server) cmdTest(msg *Message) (res resp.Value, err error) {
+// TEST (POINT lat lon)|(GET key id)|(BOUNDS minlat minlon maxlat maxlon)|
+// (OBJECT geojson)|(CIRCLE lat lon meters)|(TILE x y z)|(QUADKEY quadkey)|
+// (HASH geohash) INTERSECTS|WITHIN [CLIP] (POINT lat lon)|(GET key id)|
+// (BOUNDS minlat minlon maxlat maxlon)|(OBJECT geojson)|
+// (CIRCLE lat lon meters)|(TILE x y z)|(QUADKEY quadkey)|(HASH geohash)|
+// (SECTOR lat lon meters bearing1 bearing2)
+func (s *Server) cmdTEST(msg *Message) (res resp.Value, err error) {
 	start := time.Now()
+
 	vs := msg.Args[1:]
 
 	var ok bool
 	var test string
-	var obj1, obj2, clipped geojson.Object
-	if vs, obj1, err = s.parseArea(vs, false); err != nil {
+	var clipped geojson.Object
+	var area1, area2 *areaExpression
+	if vs, area1, err = s.parseAreaExpression(vs, false); err != nil {
 		return
 	}
 	if vs, test, ok = tokenval(vs); !ok || test == "" {
@@ -259,28 +330,32 @@ func (s *Server) cmdTest(msg *Message) (res resp.Value, err error) {
 			doClip = true
 		}
 	}
-	if vs, obj2, err = s.parseArea(vs, doClip); err != nil {
+	if vs, area2, err = s.parseAreaExpression(vs, doClip); err != nil {
+		return
+	}
+	if doClip && (area1.obj == nil || area2.obj == nil) {
+		err = errInvalidArgument("clip")
 		return
 	}
 	if len(vs) != 0 {
 		err = errInvalidNumberOfArguments
+		return
 	}
 
 	var result int
 	if lTest == "within" {
-		if obj1.Within(obj2) {
+		if area1.WithinExpr(area2) {
 			result = 1
 		}
 	} else if lTest == "intersects" {
-		if obj1.Intersects(obj2) {
+		if area1.IntersectsExpr(area2) {
 			result = 1
 			if doClip {
-				clipped = clip.Clip(obj1, obj2)
+				clipped = clip.Clip(area1.obj, area2.obj, nil)
 			}
 		}
 	}
-	switch msg.OutputType {
-	case JSON:
+	if msg.OutputType == JSON {
 		var buf bytes.Buffer
 		buf.WriteString(`{"ok":true`)
 		if result != 0 {
@@ -291,15 +366,13 @@ func (s *Server) cmdTest(msg *Message) (res resp.Value, err error) {
 		if clipped != nil {
 			buf.WriteString(`,"object":` + clipped.JSON())
 		}
-		buf.WriteString(`,"elapsed":"` + time.Now().Sub(start).String() + "\"}")
+		buf.WriteString(`,"elapsed":"` + time.Since(start).String() + "\"}")
 		return resp.StringValue(buf.String()), nil
-	case RESP:
-		if clipped != nil {
-			return resp.ArrayValue([]resp.Value{
-				resp.IntegerValue(result),
-				resp.StringValue(clipped.JSON())}), nil
-		}
-		return resp.IntegerValue(result), nil
 	}
-	return NOMessage, nil
+	if clipped != nil {
+		return resp.ArrayValue([]resp.Value{
+			resp.IntegerValue(result),
+			resp.StringValue(clipped.JSON())}), nil
+	}
+	return resp.IntegerValue(result), nil
 }

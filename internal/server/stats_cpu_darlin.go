@@ -1,4 +1,4 @@
-// +build linux darwin
+//go:build linux || darwin
 
 package server
 
@@ -8,7 +8,7 @@ import (
 	"syscall"
 )
 
-func (c *Server) writeInfoCPU(w *bytes.Buffer) {
+func (s *Server) writeInfoCPU(w *bytes.Buffer) {
 	var selfRu syscall.Rusage
 	var cRu syscall.Rusage
 	syscall.Getrusage(syscall.RUSAGE_SELF, &selfRu)

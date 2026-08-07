@@ -34,10 +34,10 @@ func newPubsub() *pubsub {
 }
 
 // Publish a message to subscribers
-func (c *Server) Publish(channel string, message ...string) int {
+func (s *Server) Publish(channel string, message ...string) int {
 	var msgs []submsg
-	c.pubsub.mu.RLock()
-	if hub := c.pubsub.hubs[pubsubChannel][channel]; hub != nil {
+	s.pubsub.mu.RLock()
+	if hub := s.pubsub.hubs[pubsubChannel][channel]; hub != nil {
 		for target := range hub.targets {
 			for _, message := range message {
 				msgs = append(msgs, submsg{
@@ -49,7 +49,7 @@ func (c *Server) Publish(channel string, message ...string) int {
 			}
 		}
 	}
-	for pattern, hub := range c.pubsub.hubs[pubsubPattern] {
+	for pattern, hub := range s.pubsub.hubs[pubsubPattern] {
 		if match.Match(channel, pattern) {
 			for target := range hub.targets {
 				for _, message := range message {
@@ -64,14 +64,18 @@ func (c *Server) Publish(channel string, message ...string) int {
 			}
 		}
 	}
-	c.pubsub.mu.RUnlock()
+	s.pubsub.mu.RUnlock()
 
+	// broadcast to clients
 	for _, msg := range msgs {
 		msg.target.cond.L.Lock()
 		msg.target.msgs = append(msg.target.msgs, msg)
 		msg.target.cond.Broadcast()
 		msg.target.cond.L.Unlock()
 	}
+
+	// Broadcast to followers
+	s.sendPublishQueue(channel, message...)
 
 	return len(msgs)
 }
@@ -137,21 +141,21 @@ func (sub liveSubscriptionSwitches) Error() string {
 	return goingLive
 }
 
-func (c *Server) cmdSubscribe(msg *Message) (resp.Value, error) {
+func (s *Server) cmdSubscribe(msg *Message) (resp.Value, error) {
 	if len(msg.Args) < 2 {
 		return resp.Value{}, errInvalidNumberOfArguments
 	}
 	return NOMessage, liveSubscriptionSwitches{}
 }
 
-func (c *Server) cmdPsubscribe(msg *Message) (resp.Value, error) {
+func (s *Server) cmdPsubscribe(msg *Message) (resp.Value, error) {
 	if len(msg.Args) < 2 {
 		return resp.Value{}, errInvalidNumberOfArguments
 	}
 	return NOMessage, liveSubscriptionSwitches{}
 }
 
-func (c *Server) cmdPublish(msg *Message) (resp.Value, error) {
+func (s *Server) cmdPublish(msg *Message) (resp.Value, error) {
 	start := time.Now()
 	if len(msg.Args) != 3 {
 		return resp.Value{}, errInvalidNumberOfArguments
@@ -160,20 +164,20 @@ func (c *Server) cmdPublish(msg *Message) (resp.Value, error) {
 	channel := msg.Args[1]
 	message := msg.Args[2]
 	//geofence := gjson.Valid(message) && gjson.Get(message, "fence").Bool()
-	n := c.Publish(channel, message) //, geofence)
+	n := s.Publish(channel, message) //, geofence)
 	var res resp.Value
 	switch msg.OutputType {
 	case JSON:
 		res = resp.StringValue(`{"ok":true` +
 			`,"published":` + strconv.FormatInt(int64(n), 10) +
-			`,"elapsed":"` + time.Now().Sub(start).String() + `"}`)
+			`,"elapsed":"` + time.Since(start).String() + `"}`)
 	case RESP:
 		res = resp.IntegerValue(n)
 	}
 	return res, nil
 }
 
-func (c *Server) liveSubscription(
+func (s *Server) liveSubscription(
 	conn net.Conn,
 	rd *PipelineReader,
 	msg *Message,
@@ -185,6 +189,8 @@ func (c *Server) liveSubscription(
 	connType := msg.ConnType
 	if websocket {
 		outputType = JSON
+	} else if msg.StrictRESP {
+		outputType = RESP
 	}
 
 	var start time.Time
@@ -194,22 +200,41 @@ func (c *Server) liveSubscription(
 	write := func(data []byte) {
 		writeLock.Lock()
 		defer writeLock.Unlock()
-		writeLiveMessage(conn, data, false, connType, websocket)
+		writeLiveMessage(conn, data, outputType == JSON, connType, websocket)
 	}
 	writeOK := func() {
 		switch outputType {
 		case JSON:
 			write([]byte(`{"ok":true` +
-				`,"elapsed":"` + time.Now().Sub(start).String() + `"}`))
+				`,"elapsed":"` + time.Since(start).String() + `"}`))
 		case RESP:
 			write([]byte("+OK\r\n"))
+		}
+	}
+	writePing := func(m *Message) {
+		switch outputType {
+		case JSON:
+			if len(m.Args) > 1 {
+				write([]byte(`{"ok":true,"ping":` + jsonString(m.Args[1]) + `,"elapsed":"` + time.Since(start).String() + `"}`))
+			} else {
+				write([]byte(`{"ok":true,"ping":"pong","elapsed":"` + time.Since(start).String() + `"}`))
+			}
+		case RESP:
+			data := redcon.AppendArray(nil, 2)
+			data = redcon.AppendBulkString(data, "PONG")
+			if len(m.Args) > 1 {
+				data = redcon.AppendBulkString(data, m.Args[1])
+			} else {
+				data = redcon.AppendBulkString(data, "")
+			}
+			write(data)
 		}
 	}
 	writeWrongNumberOfArgsErr := func(command string) {
 		switch outputType {
 		case JSON:
 			write([]byte(`{"ok":false,"err":"invalid number of arguments"` +
-				`,"elapsed":"` + time.Now().Sub(start).String() + `"}`))
+				`,"elapsed":"` + time.Since(start).String() + `"}`))
 		case RESP:
 			write([]byte("-ERR wrong number of arguments " +
 				"for '" + command + "' command\r\n"))
@@ -221,7 +246,7 @@ func (c *Server) liveSubscription(
 			write([]byte(`{"ok":false` +
 				`,"err":"only (P)SUBSCRIBE / (P)UNSUBSCRIBE / ` +
 				`PING / QUIT allowed in this context"` +
-				`,"elapsed":"` + time.Now().Sub(start).String() + `"}`))
+				`,"elapsed":"` + time.Since(start).String() + `"}`))
 		case RESP:
 			write([]byte("-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / " +
 				"PING / QUIT allowed in this context\r\n"))
@@ -234,7 +259,7 @@ func (c *Server) liveSubscription(
 				`,"command":` + jsonString(command) +
 				`,"channel":` + jsonString(channel) +
 				`,"num":` + strconv.FormatInt(int64(num), 10) +
-				`,"elapsed":"` + time.Now().Sub(start).String() + `"}`))
+				`,"elapsed":"` + time.Since(start).String() + `"}`))
 		case RESP:
 			b := redcon.AppendArray(nil, 3)
 			b = redcon.AppendBulkString(b, command)
@@ -280,7 +305,7 @@ func (c *Server) liveSubscription(
 				write(b)
 			}
 		}
-		c.statsTotalMsgsSent.add(1)
+		s.statsTotalMsgsSent.Add(1)
 	}
 
 	m := [2]map[string]bool{
@@ -293,7 +318,7 @@ func (c *Server) liveSubscription(
 	defer func() {
 		for i := 0; i < 2; i++ {
 			for channel := range m[i] {
-				c.pubsub.unregister(i, channel, target)
+				s.pubsub.unregister(i, channel, target)
 			}
 		}
 		target.cond.L.Lock()
@@ -304,24 +329,22 @@ func (c *Server) liveSubscription(
 	go func() {
 		log.Debugf("pubsub open")
 		defer log.Debugf("pubsub closed")
+		target.cond.L.Lock()
+		defer target.cond.L.Unlock()
 		for {
-			var msgs []submsg
-			target.cond.L.Lock()
-			if len(target.msgs) > 0 {
-				msgs = target.msgs
+			for len(target.msgs) > 0 {
+				msgs := target.msgs
 				target.msgs = nil
-			}
-			target.cond.L.Unlock()
-			for _, msg := range msgs {
-				writeMessage(msg)
-			}
-			target.cond.L.Lock()
-			if target.closed {
 				target.cond.L.Unlock()
-				return
+				for _, msg := range msgs {
+					writeMessage(msg)
+				}
+				target.cond.L.Lock()
+			}
+			if target.closed {
+				break
 			}
 			target.cond.Wait()
-			target.cond.L.Unlock()
 		}
 	}()
 
@@ -335,6 +358,9 @@ func (c *Server) liveSubscription(
 			case "quit":
 				writeOK()
 				return nil
+			case "ping":
+				writePing(msg)
+				continue
 			case "psubscribe":
 				kind, un = pubsubPattern, false
 			case "punsubscribe":
@@ -354,10 +380,10 @@ func (c *Server) liveSubscription(
 				channel := msg.Args[i]
 				if un {
 					delete(m[kind], channel)
-					c.pubsub.unregister(kind, channel, target)
+					s.pubsub.unregister(kind, channel, target)
 				} else {
 					m[kind][channel] = true
-					c.pubsub.register(kind, channel, target)
+					s.pubsub.register(kind, channel, target)
 				}
 				writeSubscribe(msg.Command(), channel, len(m[0])+len(m[1]))
 			}

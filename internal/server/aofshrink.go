@@ -3,46 +3,42 @@ package server
 import (
 	"math"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/tidwall/geojson"
-	"github.com/tidwall/tile38/core"
+	"github.com/tidwall/btree"
 	"github.com/tidwall/tile38/internal/collection"
+	"github.com/tidwall/tile38/internal/field"
 	"github.com/tidwall/tile38/internal/log"
+	"github.com/tidwall/tile38/internal/object"
 )
 
 const maxkeys = 8
 const maxids = 32
 const maxchunk = 4 * 1024 * 1024
 
-func (server *Server) aofshrink() {
-	if server.aof == nil {
-		return
-	}
+func (s *Server) aofshrink() {
 	start := time.Now()
-	server.mu.Lock()
-	if server.shrinking {
-		server.mu.Unlock()
+	s.mu.Lock()
+	if s.aof == nil || s.shrinking {
+		s.mu.Unlock()
 		return
 	}
-	server.shrinking = true
-	server.shrinklog = nil
-	server.mu.Unlock()
+	s.shrinking = true
+	s.shrinklog = nil
+	s.mu.Unlock()
 
 	defer func() {
-		server.mu.Lock()
-		server.shrinking = false
-		server.shrinklog = nil
-		server.mu.Unlock()
-		log.Infof("aof shrink ended %v", time.Now().Sub(start))
-		return
+		s.mu.Lock()
+		s.shrinking = false
+		s.shrinklog = nil
+		s.mu.Unlock()
+		log.Infof("aof shrink ended %v", time.Since(start))
 	}()
 
 	err := func() error {
-		f, err := os.Create(core.AppendFileName + "-shrink")
+		f, err := os.Create(s.opts.AppendFileName + "-shrink")
 		if err != nil {
 			return err
 		}
@@ -60,17 +56,19 @@ func (server *Server) aofshrink() {
 				}
 				keysdone = true
 				func() {
-					server.mu.Lock()
-					defer server.mu.Unlock()
-					server.scanGreaterOrEqual(nextkey, func(key string, col *collection.Collection) bool {
-						if len(keys) == maxkeys {
-							keysdone = false
-							nextkey = key
-							return false
-						}
-						keys = append(keys, key)
-						return true
-					})
+					s.mu.Lock()
+					defer s.mu.Unlock()
+					s.cols.Ascend(nextkey,
+						func(key string, col *collection.Collection) bool {
+							if len(keys) == maxkeys {
+								keysdone = false
+								nextkey = key
+								return false
+							}
+							keys = append(keys, key)
+							return true
+						},
+					)
 				}()
 				continue
 			}
@@ -86,53 +84,50 @@ func (server *Server) aofshrink() {
 				// load more objects
 				func() {
 					idsdone = true
-					server.mu.Lock()
-					defer server.mu.Unlock()
-					col := server.getCol(keys[0])
-					if col == nil {
+					s.mu.Lock()
+					defer s.mu.Unlock()
+					col, ok := s.cols.Get(keys[0])
+					if !ok {
 						return
 					}
-					var fnames = col.FieldArr()       // reload an array of field names to match each object
-					var exm = server.expires[keys[0]] // the expiration map
-					var now = time.Now()              // used for expiration
-					var count = 0                     // the object count
+					var now = time.Now().UnixNano() // used for expiration
+					var count = 0                   // the object count
 					col.ScanGreaterOrEqual(nextid, false, nil, nil,
-						func(id string, obj geojson.Object, fields []float64) bool {
+						func(o *object.Object) bool {
 							if count == maxids {
 								// we reached the max number of ids for one batch
-								nextid = id
+								nextid = o.ID()
 								idsdone = false
 								return false
 							}
-
 							// here we fill the values array with a new command
 							values = values[:0]
 							values = append(values, "set")
 							values = append(values, keys[0])
-							values = append(values, id)
-							for i, fvalue := range fields {
-								if fvalue != 0 {
+							values = append(values, o.ID())
+							o.Fields().Scan(func(f field.Field) bool {
+								if !f.Value().IsZero() {
 									values = append(values, "field")
-									values = append(values, fnames[i])
-									values = append(values, strconv.FormatFloat(fvalue, 'f', -1, 64))
+									values = append(values, f.Name())
+									values = append(values, f.Value().JSON())
 								}
-							}
-							if exm != nil {
-								at, ok := exm[id]
-								if ok {
-									expires := at.Sub(now)
-									if expires > 0 {
-										values = append(values, "ex")
-										values = append(values, strconv.FormatFloat(math.Floor(float64(expires)/float64(time.Second)*10)/10, 'f', -1, 64))
-									}
+								return true
+							})
+							if o.Expires() != 0 {
+								ttl := math.Floor(float64(o.Expires()-now)/float64(time.Second)*10) / 10
+								if ttl < 0.1 {
+									// always leave a little bit of ttl.
+									ttl = 0.1
 								}
+								values = append(values, "ex")
+								values = append(values, strconv.FormatFloat(ttl, 'f', -1, 64))
 							}
-							if objIsSpatial(obj) {
+							if objIsSpatial(o.Geo()) {
 								values = append(values, "object")
-								values = append(values, string(obj.AppendJSON(nil)))
+								values = append(values, string(o.Geo().AppendJSON(nil)))
 							} else {
 								values = append(values, "string")
-								values = append(values, obj.String())
+								values = append(values, o.Geo().String())
 							}
 
 							// append the values to the aof buffer
@@ -167,19 +162,21 @@ func (server *Server) aofshrink() {
 		// first load the names of the hooks
 		var hnames []string
 		func() {
-			server.mu.Lock()
-			defer server.mu.Unlock()
-			for name := range server.hooks {
-				hnames = append(hnames, name)
-			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			hnames = make([]string, 0, s.hooks.Len())
+			s.hooks.Walk(func(v []interface{}) {
+				for _, v := range v {
+					hnames = append(hnames, v.(*Hook).Name)
+				}
+			})
 		}()
-		// sort the names for consistency
-		sort.Strings(hnames)
+		var hookHint btree.PathHint
 		for _, name := range hnames {
 			func() {
-				server.mu.Lock()
-				defer server.mu.Unlock()
-				hook := server.hooks[name]
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				hook, _ := s.hooks.GetHint(&Hook{Name: name}, &hookHint).(*Hook)
 				if hook == nil {
 					return
 				}
@@ -192,20 +189,16 @@ func (server *Server) aofshrink() {
 				} else {
 					values = append(values, "sethook", name,
 						strings.Join(hook.Endpoints, ","))
-					values = append(values)
 				}
 				for _, meta := range hook.Metas {
 					values = append(values, "meta", meta.Name, meta.Value)
 				}
 				if !hook.expires.IsZero() {
-					ex := float64(hook.expires.Sub(time.Now())) /
-						float64(time.Second)
+					ex := float64(time.Until(hook.expires)) / float64(time.Second)
 					values = append(values, "ex",
 						strconv.FormatFloat(ex, 'f', 1, 64))
 				}
-				for _, value := range hook.Message.Args {
-					values = append(values, value)
-				}
+				values = append(values, hook.Message.Args...)
 				// append the values to the aof buffer
 				aofbuf = append(aofbuf, '*')
 				aofbuf = append(aofbuf, strconv.FormatInt(int64(len(values)), 10)...)
@@ -232,14 +225,26 @@ func (server *Server) aofshrink() {
 		// finally grab any new data that may have been written since
 		// the aofshrink has started and swap out the files.
 		return func() error {
-			server.mu.Lock()
-			defer server.mu.Unlock()
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			// kill all followers connections and close their files. This
+			// ensures that there is only one opened AOF at a time which is
+			// what Windows requires in order to perform the Rename function
+			// below.
+			for conn, f := range s.aofconnM {
+				conn.Close()
+				f.Close()
+			}
+
+			// send a broadcast to all sleeping followers
+			s.fcond.Broadcast()
 
 			// flush the aof buffer
-			server.flushAOF(false)
+			s.flushAOF(false)
 
 			aofbuf = aofbuf[:0]
-			for _, values := range server.shrinklog {
+			for _, values := range s.shrinklog {
 				// append the values to the aof buffer
 				aofbuf = append(aofbuf, '*')
 				aofbuf = append(aofbuf, strconv.FormatInt(int64(len(values)), 10)...)
@@ -264,35 +269,31 @@ func (server *Server) aofshrink() {
 
 			// anything below this point is unrecoverable. just log and exit process
 			// back up the live aof, just in case of fatal error
-			if err := server.aof.Close(); err != nil {
+			if err := s.aof.Close(); err != nil {
 				log.Fatalf("shrink live aof close fatal operation: %v", err)
 			}
 			if err := f.Close(); err != nil {
 				log.Fatalf("shrink new aof close fatal operation: %v", err)
 			}
-			if err := os.Rename(core.AppendFileName, core.AppendFileName+"-bak"); err != nil {
+			if err := os.Rename(s.opts.AppendFileName, s.opts.AppendFileName+"-bak"); err != nil {
 				log.Fatalf("shrink backup fatal operation: %v", err)
 			}
-			if err := os.Rename(core.AppendFileName+"-shrink", core.AppendFileName); err != nil {
+			if err := os.Rename(s.opts.AppendFileName+"-shrink", s.opts.AppendFileName); err != nil {
 				log.Fatalf("shrink rename fatal operation: %v", err)
 			}
-			server.aof, err = os.OpenFile(core.AppendFileName, os.O_CREATE|os.O_RDWR, 0600)
+			s.aof, err = os.OpenFile(s.opts.AppendFileName, os.O_CREATE|os.O_RDWR, 0600)
 			if err != nil {
 				log.Fatalf("shrink openfile fatal operation: %v", err)
 			}
 			var n int64
-			n, err = server.aof.Seek(0, 2)
+			n, err = s.aof.Seek(0, 2)
 			if err != nil {
 				log.Fatalf("shrink seek end fatal operation: %v", err)
 			}
-			server.aofsz = int(n)
+			s.aofsz = int(n)
 
-			os.Remove(core.AppendFileName + "-bak") // ignore error
+			os.Remove(s.opts.AppendFileName + "-bak") // ignore error
 
-			// kill all followers connections
-			for conn := range server.aofconnM {
-				conn.Close()
-			}
 			return nil
 		}()
 	}()
