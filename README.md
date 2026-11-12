@@ -5,13 +5,6 @@
   <img alt="Tile38" src="/.github/images/logo-light.svg" width="284">
 </picture>
 </p>
-<p align="center">
-<a href="https://tile38.com/slack/"><img src="https://img.shields.io/badge/Slack-4A154B?logo=slack&logoColor=fff" alt="Slack"></a>
-<a href="https://discord.gg/esq8ESgzms"><img src="https://img.shields.io/badge/Discord-%235865F2.svg?&logo=discord&logoColor=white" alt="Discord"></a>
-</p>
-
-
-
 
 Tile38 is an open source (MIT licensed), in-memory geolocation data store, spatial index, and realtime geofencing server.
 It supports a variety of object types including lat/lon points, bounding boxes, XYZ tiles, Geohashes, and GeoJSON. 
